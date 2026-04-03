@@ -115,6 +115,68 @@ class Arena:
         self._consecutive_losses: dict = {}
         self._suspended_until: dict = {}
 
+        # FIX #71: Peak equity tracked persistently as instance var
+        self._peak_equity: float = getattr(config, 'paper_balance', 1000.0)
+
+        # FIX #73: Per-cycle learning data cache
+        self._learning_cache: dict = {}
+        self._learning_cache_cycle: int = 0
+
+    # ------------------------------------------------------------------
+    # FIX #15 / #80: Shared helpers for JSON field parsing & price parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_json_field(value, default=None):
+        """Safely parse a field that might be JSON string or already a list/dict."""
+        if default is None:
+            default = []
+        if value is None:
+            return default
+        if isinstance(value, (list, dict)):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, (list, dict)) else default
+            except (json.JSONDecodeError, TypeError):
+                return default
+        return default
+
+    @staticmethod
+    def _parse_price(market) -> float:
+        """FIX #33: Shared price parser for outcomePrices (string or list).
+        Returns the YES price as a float, defaulting to 0.5."""
+        raw = market.get("outcomePrices")
+        if raw is None:
+            return 0.5
+        # Already a list
+        if isinstance(raw, list):
+            try:
+                return float(raw[0]) if raw else 0.5
+            except (ValueError, TypeError, IndexError):
+                return 0.5
+        # String - could be JSON array like '["0.65","0.35"]' or bare number
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list) and parsed:
+                    return float(parsed[0])
+                return float(parsed)
+            except (json.JSONDecodeError, TypeError, ValueError, IndexError):
+                try:
+                    return float(raw)
+                except (ValueError, TypeError):
+                    return 0.5
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return 0.5
+
+    # ------------------------------------------------------------------
+    # Bot creation
+    # ------------------------------------------------------------------
+
     async def create_bots(self):
         """Initialize bots - restore from DB if available, else create fresh."""
         signal_weights = self.config.signals if hasattr(self.config, 'signals') else {}
@@ -145,6 +207,10 @@ class Arena:
                 await self.db.save_bot_config(bot_id, name, bot.params, 0)
                 logger.info(f"Created bot: {bot_id}")
 
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
     async def run(self):
         self._running = True
         await self.create_bots()
@@ -173,6 +239,10 @@ class Arena:
         self._running = False
         await self.price_feed.stop()
 
+    # ------------------------------------------------------------------
+    # FIX #43: Global signals gathered concurrently with asyncio.gather
+    # ------------------------------------------------------------------
+
     async def _gather_global_signals(self):
         """Gather expensive API signals that don't change per-market."""
         now = time.time()
@@ -182,8 +252,10 @@ class Arena:
         self._last_global_update = now
         signals = {}
 
-        # --- Coinglass: Derivatives data ---
-        if self.coinglass:
+        # Build tasks for concurrent fetching
+        async def _fetch_coinglass():
+            if not self.coinglass:
+                return
             try:
                 cg = await self.coinglass.get_full_snapshot("BTC")
                 signals["coinglass_composite"] = cg.get("composite_signal", 0)
@@ -199,8 +271,9 @@ class Arena:
             except Exception as e:
                 logger.warning(f"Coinglass fetch failed: {e}")
 
-        # --- Polygon.io: Technicals ---
-        if self.polygon:
+        async def _fetch_polygon():
+            if not self.polygon:
+                return
             try:
                 tech = await self.polygon.get_full_technicals("X:BTCUSD")
                 signals["polygon_composite"] = tech.get("composite_signal", 0)
@@ -216,8 +289,9 @@ class Arena:
             except Exception as e:
                 logger.warning(f"Polygon fetch failed: {e}")
 
-        # --- CryptoQuant: On-chain ---
-        if self.cryptoquant:
+        async def _fetch_cryptoquant():
+            if not self.cryptoquant:
+                return
             try:
                 onchain = await self.cryptoquant.get_full_onchain()
                 signals["onchain_composite"] = onchain.get("composite_signal", 0)
@@ -231,8 +305,9 @@ class Arena:
             except Exception as e:
                 logger.warning(f"CryptoQuant fetch failed: {e}")
 
-        # --- Twitter: Social sentiment ---
-        if self.twitter:
+        async def _fetch_twitter():
+            if not self.twitter:
+                return
             try:
                 crypto_sent = await self.twitter.get_crypto_sentiment("BTC")
                 signals["twitter_crypto_signal"] = crypto_sent.get("signal", 0)
@@ -244,12 +319,14 @@ class Arena:
                 signals["fear_greed_index"] = fear_greed.get("fear_greed_index", 50)
                 signals["fear_greed_signal"] = fear_greed.get("signal", 0)
                 signals["fear_greed_label"] = fear_greed.get("label", "neutral")
-                logger.debug(f"Twitter: sentiment={crypto_sent.get('signal', 0):.3f}, F&G={fear_greed.get('fear_greed_index', 50)}")
+                logger.debug(f"Twitter: sentiment={crypto_sent.get('signal', 0):.3f}, "
+                             f"F&G={fear_greed.get('fear_greed_index', 50)}")
             except Exception as e:
                 logger.warning(f"Twitter fetch failed: {e}")
 
-        # --- Alpha Vantage: Additional technicals ---
-        if self.alphavantage:
+        async def _fetch_alphavantage():
+            if not self.alphavantage:
+                return
             try:
                 av = await self.alphavantage.get_full_crypto_technicals("BTC")
                 signals["av_composite"] = av.get("composite_signal", 0)
@@ -263,22 +340,40 @@ class Arena:
             except Exception as e:
                 logger.warning(f"Alpha Vantage fetch failed: {e}")
 
-        # --- NewsAPI sentiment ---
-        if self.sentiment_scorer:
+        async def _fetch_news():
+            if not self.sentiment_scorer:
+                return
             try:
                 news_sent = await self.sentiment_scorer.get_sentiment("bitcoin crypto")
                 signals["news_sentiment"] = news_sent
             except Exception as e:
                 logger.warning(f"NewsAPI fetch failed: {e}")
 
-        # --- Sportsbook odds (for sports markets) ---
-        if self.odds_client:
+        async def _fetch_sportsbook():
+            if not self.odds_client:
+                return
             try:
                 signals["sportsbook_odds"] = await self.odds_client.get_all_sport_odds()
             except Exception as e:
                 logger.warning(f"Odds API fetch failed: {e}")
 
+        # FIX #43: Run all global fetches concurrently
+        await asyncio.gather(
+            _fetch_coinglass(),
+            _fetch_polygon(),
+            _fetch_cryptoquant(),
+            _fetch_twitter(),
+            _fetch_alphavantage(),
+            _fetch_news(),
+            _fetch_sportsbook(),
+            return_exceptions=True,
+        )
+
         # --- MEGA COMPOSITE: Combine all global signals ---
+        # FIX #25: trend term now contributes its actual 0.10 weight, not 0.01
+        trend = signals.get("polygon_trend")
+        trend_value = 1.0 if trend == "bullish" else (-1.0 if trend == "bearish" else 0.0)
+
         mega_composite = (
             signals.get("coinglass_composite", 0) * 0.20 +
             signals.get("polygon_composite", 0) * 0.15 +
@@ -287,7 +382,7 @@ class Arena:
             signals.get("fear_greed_signal", 0) * 0.10 +
             signals.get("av_composite", 0) * 0.15 +
             signals.get("news_sentiment", 0) * 0.05 +
-            (0.1 if signals.get("polygon_trend") == "bullish" else -0.1 if signals.get("polygon_trend") == "bearish" else 0) * 0.10
+            trend_value * 0.10
         )
         signals["mega_composite"] = round(mega_composite, 4)
 
@@ -305,222 +400,305 @@ class Arena:
         logger.info(f"Global signals updated: mega_composite={mega_composite:.4f}, "
                      f"regime={signals.get('regime', '?')}, F&G={signals.get('fear_greed_index', '?')}")
 
+    # ------------------------------------------------------------------
+    # FIX #78: _trade_cycle split into smaller methods
+    # ------------------------------------------------------------------
+
     async def _trade_cycle(self):
         """Discover markets, gather ALL signals, run bots."""
         try:
             # Update global (expensive) signals
             await self._gather_global_signals()
 
+            # FIX #89: Force-refresh AskLivermore market data at start of trade cycle
+            if self.asklivermore and self._al_signals:
+                try:
+                    self._al_signals = await self.al_xref.enrich_signals(self._al_signals)
+                except Exception:
+                    pass
+
             # Use MarketDiscovery for categorized, enriched markets
-            markets = await self.discovery.discover_all()
+            all_markets = await self.discovery.discover_all()
+
+            # FIX #36/#37: Limit to top 50 markets by liquidity instead of all
+            all_markets = self._filter_top_markets(all_markets, limit=50)
+
             price_snap = self.price_feed.get_snapshot()
 
-            for market in markets:
+            # FIX #41: Query open_trades ONCE outside the market loop
+            open_trades = await self.db.get_open_trades()
+
+            # FIX #27: Read max_concurrent_trades from risk dict only
+            max_concurrent = self.config.risk.get("max_concurrent_trades", 5)
+
+            # FIX #57: Track already-traded market IDs this cycle
+            traded_market_ids_this_cycle: set = set()
+
+            # FIX #73: Invalidate learning cache for new cycle
+            self._learning_cache_cycle += 1
+            self._learning_cache = {}
+
+            for market in all_markets:
+                # FIX #61: Skip if we already placed a bet on this market this cycle
+                market_id = market.get("id", "")
+                if market_id in traded_market_ids_this_cycle:
+                    continue
+
+                # FIX #41: Check capacity using pre-fetched open_trades
+                if len(open_trades) + len(traded_market_ids_this_cycle) >= max_concurrent:
+                    break  # At capacity, stop processing markets
+
                 # Build rich signal dict combining everything
-                signals = dict(self._global_signals)  # Copy global signals
-
-                # Per-market BTC signals
-                signals.update({
-                    "btc_momentum": price_snap.get("momentum_5m", 0),
-                    "btc_momentum_5m": price_snap.get("momentum_5m", 0),
-                    "btc_momentum_15m": price_snap.get("momentum_15m", 0),
-                    "ema_bullish": price_snap.get("ema_bullish", False),
-                    "btc_price": price_snap.get("price", 0),
-                    "volume": float(market.get("volume", 0)),
-                })
-
-                # Per-market Polymarket momentum
-                if self.pm_momentum:
-                    try:
-                        tokens = market.get("clobTokenIds", [])
-                        if isinstance(tokens, str):
-                            try: tokens = json.loads(tokens)
-                            except (json.JSONDecodeError, TypeError): tokens = []
-                        if tokens:
-                            mom = await self.pm_momentum.get_momentum(tokens[0])
-                            signals["pm_direction"] = mom.get("direction", "unknown")
-                            signals["pm_momentum"] = mom.get("strength", 0)
-                            signals["pm_change_5m"] = mom.get("change_5m", 0)
-                            signals["pm_change_15m"] = mom.get("change_15m", 0)
-                    except Exception:
-                        signals.setdefault("pm_direction", "unknown")
-
-                # Per-market orderflow (use Rust engine if available)
-                if self.orderflow:
-                    try:
-                        tokens = market.get("clobTokenIds", [])
-                        if isinstance(tokens, str):
-                            try: tokens = json.loads(tokens)
-                            except (json.JSONDecodeError, TypeError): tokens = []
-                        if tokens:
-                            of = await self.orderflow.analyze(tokens[0])
-                            signals["orderflow_imbalance"] = of.get("imbalance", 0)
-                            signals["spread"] = of.get("spread", 1)
-                            signals["volume_pressure"] = of.get("volume_pressure", 0)
-
-                            # Use Rust for faster orderbook metrics if available
-                            if self.rust_orderbook and of.get("best_bid") and of.get("best_ask"):
-                                book = await self.pm.clob.get_orderbook(tokens[0])
-                                bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
-                                asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
-                                self.rust_orderbook.update(bids, asks)
-                                signals["spread"] = self.rust_orderbook.spread()
-                                signals["orderflow_imbalance"] = self.rust_orderbook.imbalance()
-                    except Exception:
-                        pass
-
-                # Sports-specific: sportsbook edge
-                if self.sportsbook_edge and signals.get("sportsbook_odds"):
-                    try:
-                        opps = self.sportsbook_edge.find_opportunities(
-                            [market], signals["sportsbook_odds"])
-                        if opps:
-                            best = opps[0]
-                            signals["sportsbook_edge"] = best.get("edge", 0)
-                            signals["sportsbook_ev"] = best.get("ev", 0)
-                            signals["bookmaker_count"] = best.get("bookmaker_count", 0)
-                    except Exception:
-                        pass
-
-                # Sports-specific: Twitter sentiment for teams
-                if self.twitter and "sport" in market.get("market_type", "").lower():
-                    try:
-                        outcomes = market.get("outcomes", [])
-                        if isinstance(outcomes, str):
-                            try: outcomes = json.loads(outcomes)
-                            except (json.JSONDecodeError, TypeError): outcomes = []
-                        if outcomes and len(outcomes) >= 2:
-                            team_sent = await self.twitter.get_sports_sentiment(outcomes[0])
-                            signals["team1_twitter_signal"] = team_sent.get("signal", 0)
-                            signals["team1_injury_mentions"] = team_sent.get("injury_mentions", 0)
-                    except Exception:
-                        pass
+                signals = await self._build_market_signals(market, price_snap)
 
                 # --- Run each bot ---
-                # Max concurrent trades check
-                open_trades = await self.db.get_open_trades()
-                max_concurrent = self.config.risk.get("max_concurrent_trades", 5)
-                if len(open_trades) >= max_concurrent:
-                    continue  # Skip this market, at capacity
-
                 for bot_id, bot in list(self.bots.items()):
+                    # FIX #61: Also skip if this market already traded this cycle
+                    if market_id in traded_market_ids_this_cycle:
+                        break
+
                     try:
-                        # Circuit breaker (PDF: 4 consecutive losses = suspension)
-                        if bot_id in self._suspended_until:
-                            if time.time() < self._suspended_until[bot_id]:
-                                continue
-                            del self._suspended_until[bot_id]
-                            self._consecutive_losses[bot_id] = 0
-
-                        # Load learning data
-                        bot.learning_data = await self.db.get_learning_data(bot_id)
-                        bot.total_observations = sum(
-                            d.get("obs", 0) for d in bot.learning_data.values())
-
-                        # Regime filter (PDF: block mean-reversion in trending)
-                        if (bot.strategy_name == "mean_reversion"
-                                and signals.get("regime") == "trending"):
-                            continue
-
-                        # Inject mega composite
-                        signals["mega_signal"] = signals.get("mega_composite", 0)
-
-                        decision = bot.make_decision(market, signals)
-                        if decision["action"] == "hold":
-                            continue
-
-                        # Skip soccer combo actions that Simmer can't handle
-                        if decision["action"] in ("buy_combo", "sell_combo", "flip_team"):
-                            # Log but don't execute through normal path
-                            logger.info(f"Soccer 3-way signal: {decision['action']} - "
-                                        f"{decision.get('reasoning', '')}")
-                            if self.config.telegram.get("notify_on_buy"):
-                                await self.telegram.send(
-                                    f"⚽ <b>SOCCER 3-WAY</b>\n"
-                                    f"Action: {decision['action']}\n"
-                                    f"{decision.get('reasoning', '')[:100]}")
-                            continue  # TODO: implement combo execution for live CLOB
-
-                        # Verify trade (pass orderflow signals for spread check)
-                        orderflow_data = {
-                            "spread": signals.get("spread"),
-                            "imbalance": signals.get("orderflow_imbalance", 0)
-                        } if signals.get("spread") is not None else None
-
-                        verification = await self.verifier.verify(
-                            decision, market, signals, orderflow=orderflow_data)
-                        if not verification["passed"]:
-                            if self.config.telegram.get("notify_on_verification_fail"):
-                                await self.telegram.notify_verification_fail(
-                                    bot_id, market.get("question", "?"),
-                                    verification["reasons"])
-                            continue
-
-                        # Balance floor check (PDF: 70% of peak equity)
-                        balance = self.config.paper_balance
-                        total_pnl = await self.db.get_total_pnl()
-                        peak = max(balance, balance + total_pnl)
-                        current_equity = balance + total_pnl
-                        floor_pct = self.config.risk.get("balance_floor_pct", 0.70)
-                        if current_equity < peak * floor_pct:
-                            logger.warning(f"Balance floor hit: {current_equity:.2f} < {floor_pct:.0%} of peak {peak:.2f}")
-                            continue
-
-                        # Size with quarter-Kelly, max bet % cap
-                        max_bet_pct = self.config.risk.get("max_bet_pct", 0.05)
-                        amount = bot.bet_size(
-                            decision["confidence"], current_equity,
-                            min(self.config.risk.get("max_position_size", 50),
-                                current_equity * max_bet_pct))
-
-                        if amount <= 0:
-                            continue  # Confidence too low for any bet
-
-                        if not self.pos_mgr.check_daily_limit():
-                            logger.warning("Daily loss cap hit")
-                            continue
-
-                        # Place trade
-                        if self.config.mode == "paper" and self.simmer:
-                            result = await self.simmer.place_bet(
-                                market.get("id", ""), decision["outcome"], amount)
-                        else:
-                            result = {"status": "simulated", "id": str(uuid.uuid4())}
-
-                        # Enrich decision with all signals for learning
-                        enriched_snapshot = dict(decision.get("signals_snapshot", {}))
-                        enriched_snapshot.update({
-                            "mega_composite": signals.get("mega_composite", 0),
-                            "coinglass": signals.get("coinglass_composite", 0),
-                            "onchain": signals.get("onchain_composite", 0),
-                            "twitter": signals.get("twitter_crypto_signal", 0),
-                            "fear_greed": signals.get("fear_greed_index", 50),
-                            "polygon_rsi": signals.get("polygon_rsi", 50),
-                            "regime": signals.get("regime", "unknown"),
-                        })
-
-                        trade_id = await self.db.insert_trade(
-                            bot_id, market.get("id", ""), market.get("market_type", "unknown"),
-                            decision["action"], decision["outcome"], amount,
-                            float(market.get("outcomePrices", [0.5])[0] if isinstance(
-                                market.get("outcomePrices"), list) else 0.5),
-                            decision["confidence"], enriched_snapshot, verification)
-
-                        if self.config.telegram.get("notify_on_buy"):
-                            await self.telegram.notify_buy(
-                                bot_id, market.get("question", "?"),
-                                decision["outcome"], amount,
-                                enriched_snapshot.get("yes_price", 0),
-                                decision["confidence"], decision["reasoning"])
-
-                        logger.info(f"TRADE: {bot_id} {decision['outcome']} ${amount:.2f} "
-                                    f"conf={decision['confidence']:.2f} on {market.get('question', '?')[:50]}")
-
+                        trade_placed = await self._run_bot_on_market(
+                            bot, bot_id, market, signals, open_trades,
+                            traded_market_ids_this_cycle)
+                        if trade_placed:
+                            traded_market_ids_this_cycle.add(market_id)
                     except Exception as e:
                         logger.error(f"Bot {bot_id} error: {e}")
 
         except Exception as e:
             logger.error(f"Trade cycle error: {e}")
+
+    def _filter_top_markets(self, markets, limit=50):
+        """FIX #36/#37: Return top N markets sorted by volume/liquidity."""
+        try:
+            return sorted(
+                markets,
+                key=lambda m: float(m.get("volume", 0) or 0) + float(m.get("liquidity", 0) or 0),
+                reverse=True
+            )[:limit]
+        except (ValueError, TypeError):
+            return markets[:limit]
+
+    async def _build_market_signals(self, market, price_snap):
+        """Build per-market signal dict from global signals + per-market data."""
+        signals = dict(self._global_signals)  # Copy global signals
+
+        # Per-market BTC signals
+        signals.update({
+            "btc_momentum": price_snap.get("momentum_5m", 0),
+            "btc_momentum_5m": price_snap.get("momentum_5m", 0),
+            "btc_momentum_15m": price_snap.get("momentum_15m", 0),
+            "ema_bullish": price_snap.get("ema_bullish", False),
+            "btc_price": price_snap.get("price", 0),
+            "volume": float(market.get("volume", 0) or 0),
+        })
+
+        # FIX #80 / #15: Use _parse_json_field for token parsing everywhere
+        tokens = self._parse_json_field(market.get("clobTokenIds"))
+
+        # Per-market Polymarket momentum
+        if self.pm_momentum and tokens:
+            try:
+                mom = await self.pm_momentum.get_momentum(tokens[0])
+                signals["pm_direction"] = mom.get("direction", "unknown")
+                signals["pm_momentum"] = mom.get("strength", 0)
+                signals["pm_change_5m"] = mom.get("change_5m", 0)
+                signals["pm_change_15m"] = mom.get("change_15m", 0)
+            except Exception:
+                signals.setdefault("pm_direction", "unknown")
+
+        # Per-market orderflow (use Rust engine if available)
+        if self.orderflow and tokens:
+            try:
+                of = await self.orderflow.analyze(tokens[0])
+                signals["orderflow_imbalance"] = of.get("imbalance", 0)
+                signals["spread"] = of.get("spread", 1)
+                signals["volume_pressure"] = of.get("volume_pressure", 0)
+
+                # Use Rust for faster orderbook metrics if available
+                if self.rust_orderbook and of.get("best_bid") and of.get("best_ask"):
+                    book = await self.pm.clob.get_orderbook(tokens[0])
+                    bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
+                    asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
+                    self.rust_orderbook.update(bids, asks)
+                    signals["spread"] = self.rust_orderbook.spread()
+                    signals["orderflow_imbalance"] = self.rust_orderbook.imbalance()
+            except Exception:
+                pass
+
+        # Sports-specific: sportsbook edge
+        if self.sportsbook_edge and signals.get("sportsbook_odds"):
+            try:
+                opps = self.sportsbook_edge.find_opportunities(
+                    [market], signals["sportsbook_odds"])
+                if opps:
+                    best = opps[0]
+                    signals["sportsbook_edge"] = best.get("edge", 0)
+                    signals["sportsbook_ev"] = best.get("ev", 0)
+                    signals["bookmaker_count"] = best.get("bookmaker_count", 0)
+            except Exception:
+                pass
+
+        # Sports-specific: Twitter sentiment for teams
+        if self.twitter and "sport" in market.get("market_type", "").lower():
+            try:
+                outcomes = self._parse_json_field(market.get("outcomes"))
+                if outcomes and len(outcomes) >= 2:
+                    team_sent = await self.twitter.get_sports_sentiment(outcomes[0])
+                    signals["team1_twitter_signal"] = team_sent.get("signal", 0)
+                    signals["team1_injury_mentions"] = team_sent.get("injury_mentions", 0)
+            except Exception:
+                pass
+
+        # FIX #87: Store the correct market ID (may differ between Gamma/CLOB)
+        signals["_market_id"] = market.get("id", "")
+        signals["_condition_id"] = market.get("conditionId", market.get("id", ""))
+
+        return signals
+
+    async def _run_bot_on_market(self, bot, bot_id, market, signals,
+                                 open_trades, traded_market_ids_this_cycle):
+        """Run a single bot against a single market. Returns True if a trade was placed."""
+        # FIX #46: Circuit breaker reads thresholds from config.risk
+        cb_losses = self.config.risk.get("circuit_breaker_losses", 4)
+        cb_suspend_secs = self.config.risk.get("circuit_breaker_suspend_seconds", 300)
+
+        if bot_id in self._suspended_until:
+            if time.time() < self._suspended_until[bot_id]:
+                return False
+            del self._suspended_until[bot_id]
+            self._consecutive_losses[bot_id] = 0
+
+        # FIX #73: Load learning data from cache (per-cycle)
+        if bot_id not in self._learning_cache:
+            self._learning_cache[bot_id] = await self.db.get_learning_data(bot_id)
+        bot.learning_data = self._learning_cache[bot_id]
+        bot.total_observations = sum(
+            d.get("obs", 0) for d in bot.learning_data.values())
+
+        # Regime filter (PDF: block mean-reversion in trending)
+        if (bot.strategy_name == "mean_reversion"
+                and signals.get("regime") == "trending"):
+            return False
+
+        # Inject mega composite
+        signals["mega_signal"] = signals.get("mega_composite", 0)
+
+        decision = bot.make_decision(market, signals)
+        if decision["action"] == "hold":
+            return False
+
+        # FIX #51: Soccer combo actions - log with structured data, don't silently discard
+        if decision["action"] in ("buy_combo", "sell_combo", "flip_team"):
+            logger.info(
+                "Soccer 3-way signal",
+                extra={
+                    "action": decision["action"],
+                    "bot_id": bot_id,
+                    "market_id": market.get("id", ""),
+                    "question": market.get("question", "")[:100],
+                    "confidence": decision.get("confidence", 0),
+                    "reasoning": decision.get("reasoning", ""),
+                    "outcomes": self._parse_json_field(market.get("outcomes")),
+                    "prices": self._parse_json_field(market.get("outcomePrices")),
+                }
+            )
+            if self.config.telegram.get("notify_on_buy"):
+                await self.telegram.send(
+                    f"<b>SOCCER 3-WAY</b>\n"
+                    f"Action: {decision['action']}\n"
+                    f"Market: {market.get('question', '')[:80]}\n"
+                    f"Confidence: {decision.get('confidence', 0):.2f}\n"
+                    f"{decision.get('reasoning', '')[:100]}")
+            return False  # TODO: implement combo execution for live CLOB
+
+        # Verify trade (pass orderflow signals for spread check)
+        orderflow_data = {
+            "spread": signals.get("spread"),
+            "imbalance": signals.get("orderflow_imbalance", 0)
+        } if signals.get("spread") is not None else None
+
+        verification = await self.verifier.verify(
+            decision, market, signals, orderflow=orderflow_data)
+        if not verification["passed"]:
+            if self.config.telegram.get("notify_on_verification_fail"):
+                await self.telegram.notify_verification_fail(
+                    bot_id, market.get("question", "?"),
+                    verification["reasons"])
+            return False
+
+        # FIX #71: Balance floor check using persistent peak equity
+        balance = self.config.paper_balance
+        total_pnl = await self.db.get_total_pnl()
+        current_equity = balance + total_pnl
+        self._peak_equity = max(self._peak_equity, current_equity)
+        floor_pct = self.config.risk.get("balance_floor_pct", 0.70)
+        if current_equity < self._peak_equity * floor_pct:
+            logger.warning(f"Balance floor hit: {current_equity:.2f} < "
+                           f"{floor_pct:.0%} of peak {self._peak_equity:.2f}")
+            return False
+
+        # Size with quarter-Kelly, max bet % cap
+        max_bet_pct = self.config.risk.get("max_bet_pct", 0.05)
+        amount = bot.bet_size(
+            decision["confidence"], current_equity,
+            min(self.config.risk.get("max_position_size", 50),
+                current_equity * max_bet_pct))
+
+        if amount <= 0:
+            return False  # Confidence too low for any bet
+
+        if not self.pos_mgr.check_daily_limit():
+            logger.warning("Daily loss cap hit")
+            return False
+
+        # FIX #87: Use the correct market_id for the API
+        market_id = market.get("id", "")
+
+        # Place trade
+        if self.config.mode == "paper" and self.simmer:
+            result = await self.simmer.place_bet(
+                market_id, decision["outcome"], amount)
+        else:
+            result = {"status": "simulated", "id": str(uuid.uuid4())}
+
+        # Enrich decision with all signals for learning
+        enriched_snapshot = dict(decision.get("signals_snapshot", {}))
+        enriched_snapshot.update({
+            "mega_composite": signals.get("mega_composite", 0),
+            "coinglass": signals.get("coinglass_composite", 0),
+            "onchain": signals.get("onchain_composite", 0),
+            "twitter": signals.get("twitter_crypto_signal", 0),
+            "fear_greed": signals.get("fear_greed_index", 50),
+            "polygon_rsi": signals.get("polygon_rsi", 50),
+            "regime": signals.get("regime", "unknown"),
+        })
+
+        # FIX #33: Use shared _parse_price helper
+        entry_price = self._parse_price(market)
+
+        trade_id = await self.db.insert_trade(
+            bot_id, market_id, market.get("market_type", "unknown"),
+            decision["action"], decision["outcome"], amount,
+            entry_price,
+            decision["confidence"], enriched_snapshot, verification)
+
+        if self.config.telegram.get("notify_on_buy"):
+            await self.telegram.notify_buy(
+                bot_id, market.get("question", "?"),
+                decision["outcome"], amount,
+                enriched_snapshot.get("yes_price", 0),
+                decision["confidence"], decision["reasoning"])
+
+        logger.info(f"TRADE: {bot_id} {decision['outcome']} ${amount:.2f} "
+                    f"conf={decision['confidence']:.2f} on {market.get('question', '?')[:50]}")
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Resolution cycle
+    # ------------------------------------------------------------------
 
     async def _resolution_cycle(self):
         """Check for resolved trades, update stats, feed learning."""
@@ -533,28 +711,38 @@ class Arena:
                     if not market or market.get("active", True):
                         continue
 
-                    # Determine win/loss
-                    resolved_outcome = market.get("outcome", "")
-                    won = (trade["outcome"] == "YES" and resolved_outcome == "Yes") or \
-                          (trade["outcome"] == "NO" and resolved_outcome == "No")
+                    # FIX #23: Case-insensitive comparison for resolution
+                    resolved_outcome = (market.get("outcome", "") or "").lower()
+                    trade_outcome = (trade["outcome"] or "").lower()
+                    won = (trade_outcome == "yes" and resolved_outcome == "yes") or \
+                          (trade_outcome == "no" and resolved_outcome == "no")
                     pnl = (trade["amount"] * (1 / trade["price"] - 1)) if won else -trade["amount"]
 
                     await self.db.resolve_trade(trade["id"], pnl)
                     await self.db.update_bot_stats(trade["bot_id"], won, pnl)
                     self.pos_mgr.record_trade_result(pnl)
 
+                    # FIX #71: Update peak equity after resolution
+                    total_pnl = await self.db.get_total_pnl()
+                    current_equity = self.config.paper_balance + total_pnl
+                    self._peak_equity = max(self._peak_equity, current_equity)
+
                     # Feed online learning
                     if self.learner:
                         await self.learner.record_outcome(trade, won, pnl)
 
-                    # Circuit breaker tracking
+                    # FIX #46: Circuit breaker reads from config.risk
+                    cb_losses = self.config.risk.get("circuit_breaker_losses", 4)
+                    cb_suspend_secs = self.config.risk.get("circuit_breaker_suspend_seconds", 300)
+
                     if not won:
                         self._consecutive_losses[trade["bot_id"]] = \
                             self._consecutive_losses.get(trade["bot_id"], 0) + 1
-                        if self._consecutive_losses[trade["bot_id"]] >= 4:
-                            # PDF: 4 consecutive losses = 20-bar suspension (~5 min)
-                            self._suspended_until[trade["bot_id"]] = time.time() + 300
-                            logger.warning(f"Circuit breaker: {trade['bot_id']} suspended for 5 min")
+                        if self._consecutive_losses[trade["bot_id"]] >= cb_losses:
+                            self._suspended_until[trade["bot_id"]] = time.time() + cb_suspend_secs
+                            logger.warning(
+                                f"Circuit breaker: {trade['bot_id']} suspended "
+                                f"for {cb_suspend_secs}s after {cb_losses} consecutive losses")
                     else:
                         self._consecutive_losses[trade["bot_id"]] = 0
 
@@ -570,12 +758,17 @@ class Arena:
         except Exception as e:
             logger.error(f"Resolution cycle error: {e}")
 
+    # ------------------------------------------------------------------
+    # Evolution cycle
+    # ------------------------------------------------------------------
+
     async def _evolution_cycle(self):
         """Kill underperformers, mutate survivors."""
         try:
             stats = await self.db.get_all_bot_stats()
             min_trades = self.config.evolution.get("min_trades_for_eval", 20)
-            survival_wr = self.config.evolution.get("survival_win_rate", 0.65)
+            # FIX #69: Lower survival WR from 0.65 to 0.55
+            survival_wr = self.config.evolution.get("survival_win_rate", 0.55)
 
             eligible = [s for s in stats if s["total_trades"] >= min_trades]
             if not eligible:
@@ -588,16 +781,34 @@ class Arena:
                 survivors = [max(eligible, key=lambda x: x["win_rate"])]
                 losers = [s for s in eligible if s["bot_id"] != survivors[0]["bot_id"]]
 
+            # FIX #95: Preserve at least one bot of each active strategy type
+            strategy_coverage: dict = {}  # strategy_name -> best bot stats
+            for s in eligible:
+                bot = self.bots.get(s["bot_id"])
+                if bot:
+                    sname = bot.strategy_name
+                    if sname not in strategy_coverage or s["win_rate"] > strategy_coverage[sname]["win_rate"]:
+                        strategy_coverage[sname] = s
+
+            # Protect the best bot of each strategy from being killed
+            protected_ids = {s["bot_id"] for s in strategy_coverage.values()}
+            losers = [s for s in losers if s["bot_id"] not in protected_ids]
+
             for loser in losers:
                 parent = random.choice(survivors)
                 parent_bot = self.bots.get(parent["bot_id"])
                 if not parent_bot:
                     continue
 
+                # FIX #29: Copy parent_id BEFORE mutation loop modifies parent_bot
+                parent_id = parent_bot.bot_id
+                parent_strategy = parent_bot.strategy_name
+                parent_gen = parent_bot.generation
+
                 new_params = parent_bot.mutate()
-                gen = parent_bot.generation + 1
-                new_id = f"{parent_bot.strategy_name}-g{gen}-{int(time.time()) % 10000}"
-                cls = STRATEGY_MAP.get(parent_bot.strategy_name)
+                gen = parent_gen + 1
+                new_id = f"{parent_strategy}-g{gen}-{int(time.time()) % 10000}"
+                cls = STRATEGY_MAP.get(parent_strategy)
                 if cls:
                     # Remove old bot from memory and DB
                     self.bots.pop(loser["bot_id"], None)
@@ -609,12 +820,12 @@ class Arena:
                     new_bot.weights = {**new_bot.DEFAULT_WEIGHTS, **signal_weights}
                     self.bots[new_id] = new_bot
                     await self.db.save_bot_config(
-                        new_id, parent_bot.strategy_name, new_params, gen, parent_bot.bot_id)
+                        new_id, parent_strategy, new_params, gen, parent_id)
 
                     await self.telegram.notify_evolution(
                         loser["bot_id"], new_id,
                         f"WR {loser['win_rate']:.1%} < {survival_wr:.0%}")
-                    logger.info(f"Evolution: {loser['bot_id']} -> {new_id}")
+                    logger.info(f"Evolution: {loser['bot_id']} -> {new_id} (parent={parent_id})")
 
             # Save daily stats
             import datetime
@@ -627,6 +838,10 @@ class Arena:
 
         except Exception as e:
             logger.error(f"Evolution error: {e}")
+
+    # ------------------------------------------------------------------
+    # AskLivermore cycle
+    # ------------------------------------------------------------------
 
     async def _asklivermore_cycle(self):
         """Scrape AskLivermore A+ signals and cross-reference with Polymarket."""

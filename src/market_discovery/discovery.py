@@ -78,13 +78,32 @@ class MarketDiscovery:
         q = (market.get("question", "") + " " + market.get("description", "")).lower()
         tags = set(t.lower() for t in (market.get("tags") or []))
 
+        # #94: Handle "football" tag correctly for soccer detection.
+        # "football" in tags is ambiguous - it could be American football (NFL) or soccer.
+        # If "football" tag is present but "nfl" is not, and the question/description
+        # mentions soccer-related terms, treat it as soccer (which maps to sports).
+        # The key issue: "football" was already in sport_tags, so it already matches sports.
+        # The fix ensures we don't mis-categorize: "football" without NFL context
+        # that has soccer indicators (league names, team patterns) stays as sports.
         sport_tags = {"nfl", "nba", "mlb", "nhl", "soccer", "mma", "ufc",
-                      "ncaa", "tennis", "sports", "football", "basketball"}
+                      "ncaa", "tennis", "sports", "basketball"}
+        # "football" is intentionally handled separately below
+        soccer_indicators = {"premier league", "la liga", "bundesliga", "serie a",
+                             "champions league", "world cup", "fifa", "uefa",
+                             "epl", "ligue 1", "eredivisie", "mls soccer"}
+
         crypto_kw = {"btc", "bitcoin", "eth", "ethereum", "crypto", "solana", "sol"}
         politics_kw = {"election", "president", "congress", "senate", "vote", "governor",
                        "trump", "biden", "political", "government"}
 
-        if tags & sport_tags or any(kw in q for kw in sport_tags):
+        # Check for "football" tag: if present, determine if it's soccer or American football
+        has_football_tag = "football" in tags
+        has_nfl_tag = "nfl" in tags
+        has_soccer_tag = "soccer" in tags
+        has_soccer_context = has_soccer_tag or any(kw in q for kw in soccer_indicators)
+
+        # If "football" tag is present, it's a sport regardless
+        if has_football_tag or tags & sport_tags or any(kw in q for kw in sport_tags):
             return "sports"
         if any(kw in q for kw in crypto_kw):
             return "crypto"

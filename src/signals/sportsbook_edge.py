@@ -2,6 +2,7 @@
 import json
 import logging
 import re
+from typing import Optional, Set
 from rapidfuzz import fuzz
 
 logger = logging.getLogger(__name__)
@@ -23,12 +24,16 @@ def normalize_team(name: str) -> str:
 
 
 class SportsbookEdge:
-    def __init__(self, delta_cap: float = 0.03, min_edge: float = 0.02,
-                 min_liquidity: float = 1000, min_match_confidence: float = 0.80):
+    def __init__(self, delta_cap: float = 0.10, min_edge: float = 0.02,
+                 min_liquidity: float = 1000, min_match_confidence: float = 0.80,
+                 excluded_books: Optional[Set[str]] = None):
+        # delta_cap: upper bound on edge to filter out suspicious data.
+        # 0.03 was too tight and rejected genuine opportunities; 0.10 is more practical.
         self.delta_cap = delta_cap
         self.min_edge = min_edge
         self.min_liquidity = min_liquidity
         self.min_match_confidence = min_match_confidence
+        self.excluded_books = excluded_books or set()
 
     def find_opportunities(self, pm_markets: list, odds_data: dict) -> list:
         opportunities = []
@@ -40,11 +45,15 @@ class SportsbookEdge:
             outcomes = pm.get("outcomes", [])
             prices = pm.get("outcomePrices", [])
             if isinstance(outcomes, str):
-                try: outcomes = json.loads(outcomes)
-                except: continue
+                try:
+                    outcomes = json.loads(outcomes)
+                except (json.JSONDecodeError, ValueError):
+                    continue
             if isinstance(prices, str):
-                try: prices = json.loads(prices)
-                except: continue
+                try:
+                    prices = json.loads(prices)
+                except (json.JSONDecodeError, ValueError):
+                    continue
 
             for sport_key, sport_data in odds_data.items():
                 for event in sport_data.get("events", []):
@@ -53,6 +62,10 @@ class SportsbookEdge:
                         continue
 
                     for bk in event.get("bookmakers", []):
+                        # Skip excluded bookmakers
+                        if bk["key"] in self.excluded_books:
+                            continue
+
                         for mkt in bk.get("markets", []):
                             if mkt["key"] != "h2h":
                                 continue

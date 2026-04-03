@@ -2,11 +2,17 @@
 import logging
 import time
 import aiohttp
+from collections import OrderedDict
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# NOTE: Coinglass v2 API is deprecated. Migrate to v3 when available.
+# v3 docs: https://docs.coinglass.com/reference  (check for updated base URL)
+# For now, v2 still works but may be removed without notice.
 COINGLASS_BASE = "https://open-api.coinglass.com/public/v2"
+
+MAX_CACHE_SIZE = 100
 
 
 class CoinglassClient:
@@ -15,7 +21,7 @@ class CoinglassClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session: Optional[aiohttp.ClientSession] = None
-        self._cache: dict = {}
+        self._cache: OrderedDict = OrderedDict()
         self.cache_ttl = 60  # 1 minute cache
 
     async def __aenter__(self):
@@ -29,17 +35,38 @@ class CoinglassClient:
         if self.session:
             await self.session.close()
 
+    def _cache_get(self, key: str):
+        """Get from cache if present and not expired."""
+        if key in self._cache:
+            data, ts = self._cache[key]
+            if time.time() - ts < self.cache_ttl:
+                # Move to end (most recently used)
+                self._cache.move_to_end(key)
+                return data
+            else:
+                # Expired entry, remove it
+                del self._cache[key]
+        return None
+
+    def _cache_put(self, key: str, data):
+        """Put into cache with LRU eviction at MAX_CACHE_SIZE."""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = (data, time.time())
+        # Evict oldest entries if over max size
+        while len(self._cache) > MAX_CACHE_SIZE:
+            self._cache.popitem(last=False)
+
     async def _get(self, path: str, params: dict = None) -> dict:
         cache_key = f"{path}:{params}"
-        if cache_key in self._cache:
-            data, ts = self._cache[cache_key]
-            if time.time() - ts < self.cache_ttl:
-                return data
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         try:
             async with self.session.get(f"{COINGLASS_BASE}{path}", params=params) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
-                self._cache[cache_key] = (result, time.time())
+                self._cache_put(cache_key, result)
                 return result
         except Exception as e:
             logger.error(f"Coinglass API error: {e}")

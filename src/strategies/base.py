@@ -67,8 +67,11 @@ class BaseStrategy(ABC):
         if time_remaining < 60:
             combined *= 1.0 + self.params.get("late_window_boost", 0.25)
 
-        confidence = min(abs(combined), self.params.get("confidence_cap", 0.45))
+        # #18/#19 FIX: confidence_cap raised to 0.85 -- strategies output raw
+        # confidence and the cap is a safety net, not an everyday limiter.
+        confidence = min(abs(combined), self.params.get("confidence_cap", 0.85))
 
+        # #21 FIX: support both YES and NO outcomes
         if combined > 0.1:
             return {"action": "buy", "outcome": "YES", "confidence": round(confidence, 4),
                     "reasoning": f"{self.strategy_name}: combined={combined:.3f}",
@@ -76,7 +79,67 @@ class BaseStrategy(ABC):
                                          "pm": round(pm_mom, 3), "strat": round(strat_signal, 3),
                                          "learn": round(learn_bias, 3), "combined": round(combined, 3),
                                          "yes_price": yes_price}}
+        elif combined < -0.1:
+            return {"action": "buy", "outcome": "NO", "confidence": round(confidence, 4),
+                    "reasoning": f"{self.strategy_name}: contrarian combined={combined:.3f}",
+                    "signals_snapshot": {"mkt": round(mkt_signal, 3), "btc": round(btc_mom, 3),
+                                         "pm": round(pm_mom, 3), "strat": round(strat_signal, 3),
+                                         "learn": round(learn_bias, 3), "combined": round(combined, 3),
+                                         "yes_price": yes_price}}
         return self._hold(f"No signal (combined={combined:.3f})")
+
+    def make_exit_decision(self, position: dict, market: dict, signals: dict) -> dict:
+        """Decide whether to sell/exit an open position.
+
+        Args:
+            position: dict with keys entry_price, outcome ("YES"/"NO"),
+                      contracts, entry_time
+            market: current market data
+            signals: current signal data
+
+        Returns:
+            dict with action "sell" or "hold", plus reasoning
+        """
+        yes_price = self._get_yes_price(market)
+        entry_price = float(position.get("entry_price", yes_price))
+        outcome = position.get("outcome", "YES")
+        time_remaining = float(market.get("seconds_remaining", 300))
+        entry_time = float(position.get("entry_time", time.time()))
+        hold_seconds = time.time() - entry_time
+
+        current_value = yes_price if outcome == "YES" else (1.0 - yes_price)
+        pnl_pct = (current_value - entry_price) / entry_price if entry_price > 0 else 0.0
+
+        # Take profit: lock in gains above 12%
+        if pnl_pct >= 0.12:
+            return {"action": "sell", "reasoning": f"Take profit: {pnl_pct:.1%} gain",
+                    "pnl_pct": round(pnl_pct, 4)}
+
+        # Stop loss: cut losses beyond 13%
+        stop_loss = self.params.get("stop_loss_pct", 0.13)
+        if pnl_pct <= -stop_loss:
+            return {"action": "sell", "reasoning": f"Stop loss: {pnl_pct:.1%} loss",
+                    "pnl_pct": round(pnl_pct, 4)}
+
+        # Time-based exit: if held > 10 min and market is about to close
+        if time_remaining < 30 and hold_seconds > 600:
+            return {"action": "sell",
+                    "reasoning": f"Expiry exit: {time_remaining:.0f}s left, held {hold_seconds:.0f}s",
+                    "pnl_pct": round(pnl_pct, 4)}
+
+        # Signal reversal: re-evaluate current signals
+        strat_signal = self.get_strategy_signal(market, signals)
+        if outcome == "YES" and strat_signal < -0.3:
+            return {"action": "sell",
+                    "reasoning": f"Signal reversal: strat={strat_signal:.3f} against YES",
+                    "pnl_pct": round(pnl_pct, 4)}
+        if outcome == "NO" and strat_signal > 0.3:
+            return {"action": "sell",
+                    "reasoning": f"Signal reversal: strat={strat_signal:.3f} against NO",
+                    "pnl_pct": round(pnl_pct, 4)}
+
+        return {"action": "hold", "reasoning": f"Holding: pnl={pnl_pct:.1%}, strat={strat_signal:.3f}",
+                "pnl_pct": round(pnl_pct, 4)}
 
     @abstractmethod
     def get_strategy_signal(self, market: dict, signals: dict) -> float:
@@ -102,8 +165,10 @@ class BaseStrategy(ABC):
         return max(-1.0, min(1.0, total_bias / total_weight)) if total_weight else 0.0
 
     def bet_size(self, confidence: float, balance: float, max_pos: float = 50.0) -> float:
-        if confidence <= 0.5:
-            return 0.0  # Sub-breakeven confidence = no bet
+        # #24 FIX: return 0 for very low confidence (<0.3) but allow bets
+        # above 0.3 (not 0.5).  Quarter-Kelly still applies.
+        if confidence <= 0.3:
+            return 0.0
         kelly = (2 * confidence - 1) * 0.25  # Quarter-Kelly
         size = balance * kelly
         if size < 1.0:
@@ -140,10 +205,55 @@ class BaseStrategy(ABC):
         if 0.35 <= p < 0.40: return -0.4
         return 0.0
 
-    def _bucket_price(self, p): return ("price_vlow" if p < 0.25 else "price_low" if p < 0.40 else "price_mid" if p < 0.60 else "price_high" if p < 0.75 else "price_vhigh")
-    def _bucket_momentum(self, m): return ("mom_sdown" if m < -2 else "mom_down" if m < -0.5 else "mom_flat" if m < 0.5 else "mom_up" if m < 2 else "mom_sup")
+    # #76 FIX: expanded bucket methods to readable if/elif chains
+
+    def _bucket_price(self, p):
+        if p < 0.25:
+            return "price_vlow"
+        elif p < 0.40:
+            return "price_low"
+        elif p < 0.60:
+            return "price_mid"
+        elif p < 0.75:
+            return "price_high"
+        else:
+            return "price_vhigh"
+
+    def _bucket_momentum(self, m):
+        if m < -2:
+            return "mom_sdown"
+        elif m < -0.5:
+            return "mom_down"
+        elif m < 0.5:
+            return "mom_flat"
+        elif m < 2:
+            return "mom_up"
+        else:
+            return "mom_sup"
+
     def _bucket_time_of_day(self):
         h = time.gmtime().tm_hour
-        return "tod_morn" if 6 <= h < 12 else "tod_aftn" if 12 <= h < 18 else "tod_eve" if 18 <= h < 24 else "tod_night"
-    def _bucket_volume(self, v): return "vol_low" if v < 1000 else "vol_med" if v < 10000 else "vol_high"
-    def _bucket_time_remaining(self, s): return "tr_early" if s > 180 else "tr_mid" if s > 60 else "tr_late"
+        if 6 <= h < 12:
+            return "tod_morn"
+        elif 12 <= h < 18:
+            return "tod_aftn"
+        elif 18 <= h < 24:
+            return "tod_eve"
+        else:
+            return "tod_night"
+
+    def _bucket_volume(self, v):
+        if v < 1000:
+            return "vol_low"
+        elif v < 10000:
+            return "vol_med"
+        else:
+            return "vol_high"
+
+    def _bucket_time_remaining(self, s):
+        if s > 180:
+            return "tr_early"
+        elif s > 60:
+            return "tr_mid"
+        else:
+            return "tr_late"

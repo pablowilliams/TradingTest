@@ -1,4 +1,9 @@
-"""Twitter/X API - Real-time social sentiment from crypto and sports communities."""
+"""Twitter/X API - Real-time social sentiment from crypto and sports communities.
+
+NOTE: The /tweets/search/recent endpoint requires Twitter API v2 with
+Elevated or Pro access. Basic (free-tier) access will return 403 Forbidden.
+See: https://developer.twitter.com/en/docs/twitter-api/tweets/search/introduction
+"""
 import logging
 import time
 import re
@@ -22,6 +27,12 @@ BEARISH_WORDS = {
     "drop", "plunge", "red", "loss", "falling", "breakdown", "resistance",
     "weak", "overvalued", "bubble", "lose", "losing", "injury", "out",
     "suspend", "ban", "downtrend", "capitulation", "fear"
+}
+
+# Neutral fallback returned when the API is inaccessible (e.g. 403)
+_NEUTRAL_SENTIMENT = {
+    "score": 0, "bullish_count": 0, "bearish_count": 0,
+    "tweet_count": 0, "signal": 0, "trending_words": []
 }
 
 
@@ -60,6 +71,14 @@ class TwitterSentiment:
                 if resp.status == 429:
                     logger.warning("Twitter rate limited")
                     return []
+                if resp.status == 403:
+                    # Elevated/Pro access required for recent search.
+                    # Return empty so callers degrade to neutral sentiment.
+                    logger.warning(
+                        "Twitter 403 Forbidden - Elevated or Pro access is "
+                        "required for /tweets/search/recent. Returning neutral."
+                    )
+                    return []
                 resp.raise_for_status()
                 data = await resp.json()
                 tweets = data.get("data", [])
@@ -72,8 +91,7 @@ class TwitterSentiment:
     def _analyze_tweets(self, tweets: list) -> dict:
         """Analyze sentiment from tweet texts."""
         if not tweets:
-            return {"score": 0, "bullish_count": 0, "bearish_count": 0,
-                    "tweet_count": 0, "signal": 0, "trending_words": []}
+            return dict(_NEUTRAL_SENTIMENT)
 
         bullish_count = 0
         bearish_count = 0

@@ -4,7 +4,7 @@ from .base import BaseStrategy
 
 class MeanReversionStrategy(BaseStrategy):
     def __init__(self, bot_id: str, params: dict = None, generation: int = 0):
-        defaults = {"high_price_guard": 0.72, "low_price_guard": 0.35, "confidence_cap": 0.45,
+        defaults = {"high_price_guard": 0.72, "low_price_guard": 0.35, "confidence_cap": 0.85,
                     "late_window_boost": 0.25, "learning_weight_min": 0.05,
                     "learning_weight_max": 0.30, "extreme_threshold": 5.0,
                     "rsi_overbought": 70, "rsi_oversold": 30}
@@ -21,6 +21,10 @@ class MeanReversionStrategy(BaseStrategy):
         elif change_5m > thresh * 0.6: signal -= 0.3
         elif change_5m < -thresh * 0.6: signal += 0.3
 
+        # #72: Synthetic RSI proxy -- we don't have a real RSI feed, so we
+        # approximate it from the 15-minute price change.  This is intentionally
+        # crude; a proper RSI (14-period close-based) would require candle
+        # history that isn't available in the current signal pipeline.
         if abs(change_15m) > 0:
             rsi = max(0, min(100, 50 + change_15m * 5))
             if rsi > self.params.get("rsi_overbought", 70): signal -= 0.4

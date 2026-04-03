@@ -1,5 +1,6 @@
 """Real-time BTC price feed via Binance WebSocket."""
 import asyncio
+import itertools
 import json
 import logging
 import time
@@ -22,6 +23,9 @@ class PriceFeed:
         self.ws = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Cached list representation of self.prices, invalidated on append
+        self._prices_list: Optional[list] = None
+        self._prices_list_len: int = 0
 
     async def start(self):
         self._running = True
@@ -55,6 +59,8 @@ class PriceFeed:
                             self.current_price = close
                             if kline.get("x"):
                                 self.prices.append(close)
+                                # Invalidate cached list
+                                self._prices_list = None
             except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
                 logger.warning(f"WS disconnected: {e}, reconnecting...")
                 await asyncio.sleep(5)
@@ -64,10 +70,19 @@ class PriceFeed:
                 logger.error(f"Price feed error: {e}")
                 await asyncio.sleep(5)
 
+    def _get_prices_list(self) -> list:
+        """Return a cached list view of the deque, rebuilt only when stale."""
+        if self._prices_list is None or self._prices_list_len != len(self.prices):
+            self._prices_list = list(self.prices)
+            self._prices_list_len = len(self.prices)
+        return self._prices_list
+
     def _ema(self, period: int) -> float:
         if len(self.prices) < period:
             return self.current_price
-        data = list(self.prices)[-period * 2:]
+        # Use islice on the deque to get the tail without converting to a full list
+        n = min(period * 2, len(self.prices))
+        data = list(itertools.islice(self.prices, len(self.prices) - n, len(self.prices)))
         multiplier = 2 / (period + 1)
         ema = data[0]
         for price in data[1:]:
@@ -77,7 +92,8 @@ class PriceFeed:
     def _momentum(self, bars_back: int) -> float:
         if len(self.prices) < bars_back or self.current_price == 0:
             return 0.0
-        old_price = list(self.prices)[-bars_back]
+        prices_list = self._get_prices_list()
+        old_price = prices_list[-bars_back]
         if old_price == 0:
             return 0.0
         return (self.current_price - old_price) / old_price * 100

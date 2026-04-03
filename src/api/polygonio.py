@@ -1,6 +1,8 @@
 """Polygon.io API - Stock and crypto market data enrichment."""
+import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 import aiohttp
 from typing import Optional
 
@@ -93,10 +95,13 @@ class PolygonClient:
     async def get_crypto_aggregates(self, symbol: str = "X:BTCUSD",
                                      timespan: str = "minute", limit: int = 60) -> list:
         """Get historical bars for technical analysis."""
-        from_ts = int((time.time() - 86400) * 1000)
-        to_ts = int(time.time() * 1000)
+        # Polygon v2 aggs expects YYYY-MM-DD date strings, not epoch ms
+        from_dt = datetime.fromtimestamp(time.time() - 86400, tz=timezone.utc)
+        to_dt = datetime.fromtimestamp(time.time(), tz=timezone.utc)
+        from_str = from_dt.strftime("%Y-%m-%d")
+        to_str = to_dt.strftime("%Y-%m-%d")
         data = await self._get(
-            f"/v2/aggs/ticker/{symbol}/range/1/{timespan}/{from_ts}/{to_ts}",
+            f"/v2/aggs/ticker/{symbol}/range/1/{timespan}/{from_str}/{to_str}",
             {"limit": limit, "sort": "desc"})
         results = data.get("results", [])
         return [{"open": r["o"], "high": r["h"], "low": r["l"], "close": r["c"],
@@ -160,12 +165,16 @@ class PolygonClient:
         return {"macd": 0, "signal_line": 0, "histogram": 0, "signal": 0}
 
     async def get_full_technicals(self, symbol: str = "X:BTCUSD") -> dict:
-        """Get all technical indicators in one call."""
-        snapshot = await self.get_crypto_snapshot(symbol)
-        rsi = await self.get_rsi(symbol)
-        macd = await self.get_macd(symbol)
-        sma20 = await self.get_sma(symbol, 20)
-        sma50 = await self.get_sma(symbol, 50)
+        """Get all technical indicators in one call (parallel)."""
+        snapshot_task = asyncio.ensure_future(self.get_crypto_snapshot(symbol))
+        rsi_task = asyncio.ensure_future(self.get_rsi(symbol))
+        macd_task = asyncio.ensure_future(self.get_macd(symbol))
+        sma20_task = asyncio.ensure_future(self.get_sma(symbol, 20))
+        sma50_task = asyncio.ensure_future(self.get_sma(symbol, 50))
+
+        snapshot, rsi, macd, sma20, sma50 = await asyncio.gather(
+            snapshot_task, rsi_task, macd_task, sma20_task, sma50_task
+        )
 
         # Composite technical signal
         composite = (

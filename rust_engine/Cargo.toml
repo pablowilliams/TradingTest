@@ -7,9 +7,6 @@ edition = "2021"
 name = "trading_engine"
 crate-type = ["cdylib"]
 
+# #44: Removed unused tokio, reqwest, serde deps - only pyo3 is needed
 [dependencies]
 pyo3 = { version = "0.20", features = ["extension-module"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }

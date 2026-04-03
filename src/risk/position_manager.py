@@ -31,11 +31,16 @@ class PositionManager:
             return 0.0
         kelly = max(0, (2 * confidence - 1) * 0.25)
         size = balance * kelly
-        return max(1.0, min(size, self.max_position))
+        # #24 FIX: removed max(1.0, ...) that forced a $1 minimum bet.
+        # Let the strategy's bet_size() handle minimum-bet logic instead.
+        return min(size, self.max_position)
 
     def calculate_scale_out(self, entry_price: float, contracts: int,
                             stop_loss_points: float, value_per_point: float = 1.0) -> list:
-        """Calculate scale-out targets (covering queen logic)."""
+        """Calculate scale-out targets (covering queen logic).
+
+        Available for arena to call when managing open positions.
+        """
         targets = []
         for close_n in range(1, contracts):
             remaining = contracts - close_n
@@ -55,7 +60,10 @@ class PositionManager:
         return targets
 
     def should_stop_loss(self, entry_price: float, current_price: float) -> bool:
-        """Check if stop loss should trigger."""
+        """Check if stop loss should trigger.
+
+        Available for arena to call on each tick for open positions.
+        """
         if entry_price == 0:
             return False
         loss_pct = (entry_price - current_price) / entry_price

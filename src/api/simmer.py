@@ -1,4 +1,9 @@
-"""Simmer paper trading client."""
+"""Simmer paper trading client.
+
+NOTE: The SIMMER_BASE URL (https://api.simmer.trade) may need updating if the
+Simmer platform changes its domain or API versioning. Check the Simmer docs
+for the latest base URL before deploying.
+"""
 import logging
 import aiohttp
 from typing import Optional

@@ -4,7 +4,7 @@ from .base import BaseStrategy
 
 class SniperStrategy(BaseStrategy):
     def __init__(self, bot_id: str, params: dict = None, generation: int = 0):
-        defaults = {"high_price_guard": 0.78, "low_price_guard": 0.35, "confidence_cap": 0.45,
+        defaults = {"high_price_guard": 0.78, "low_price_guard": 0.35, "confidence_cap": 0.85,
                     "late_window_boost": 0.25, "learning_weight_min": 0.0,
                     "learning_weight_max": 0.0, "cheap_zone_low": 0.40, "cheap_zone_high": 0.48,
                     "strong_zone_low": 0.58, "strong_zone_high": 0.78}
@@ -32,4 +32,6 @@ class SniperStrategy(BaseStrategy):
 
         if not confirmed:
             return 0.0
-        return 0.7 if in_cheap else 0.9
+        # #91 FIX: cheap zone gets 0.9 (better risk/reward at lower prices),
+        # strong zone gets 0.6 (higher price = less upside).
+        return 0.9 if in_cheap else 0.6

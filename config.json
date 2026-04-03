@@ -37,7 +37,7 @@
     "max_position_size": 50.0,
     "daily_loss_cap": 100.0,
     "balance_floor_pct": 0.70,
-    "confidence_cap": 0.45,
+    "confidence_cap": 0.85,
     "no_bet_ban": true,
     "high_price_guard": 0.72,
     "low_price_guard": 0.35,
@@ -51,7 +51,7 @@
   },
 
   "verification": {
-    "min_confidence": 0.60,
+    "min_confidence": 0.35,
     "min_signals_agree": 3,
     "require_positive_ev": true,
     "max_spread": 0.05,
@@ -61,7 +61,7 @@
 
   "evolution": {
     "min_trades_for_eval": 20,
-    "survival_win_rate": 0.65,
+    "survival_win_rate": 0.55,
     "mutation_range": 0.15,
     "mutation_params": 3
   },
@@ -81,7 +81,8 @@
   },
 
   "sportsbook": {
-    "delta_cap": 0.03,
+    "delta_cap": 0.10,
+    "min_edge": 0.02,
     "min_match_confidence": 0.80,
     "min_liquidity": 1000,
     "excluded_books": ["BetRivers", "Bovada", "MyBookie"]
@@ -92,5 +93,12 @@
     "sell_profit_threshold": 0.99,
     "risk_reduce_threshold": 0.13,
     "poll_interval_ms": 200
+  },
+
+  "circuit_breaker": {
+    "max_consecutive_losses": 4,
+    "cooldown_seconds": 300,
+    "max_daily_loss": 100.0,
+    "pause_on_trigger": true
   }
 }

@@ -10,6 +10,9 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 DATA_BASE = "https://data-api.polymarket.com"
 
+# Safety bound to prevent infinite pagination loops
+MAX_ALL_MARKETS = 2000
+
 
 class _BaseClient:
     def __init__(self, session: aiohttp.ClientSession, base_url: str):
@@ -56,6 +59,7 @@ class GammaClient(_BaseClient):
         return data if isinstance(data, list) else data.get("data", data.get("events", []))
 
     async def get_all_markets(self, active: bool = True) -> list:
+        """Fetch all markets with pagination, capped at MAX_ALL_MARKETS."""
         all_markets, offset = [], 0
         while True:
             batch = await self.get_markets(limit=100, offset=offset, active=active)
@@ -64,6 +68,11 @@ class GammaClient(_BaseClient):
             all_markets.extend(batch)
             offset += len(batch)
             if len(batch) < 100:
+                break
+            if len(all_markets) >= MAX_ALL_MARKETS:
+                logger.warning(
+                    f"get_all_markets hit safety cap of {MAX_ALL_MARKETS} markets"
+                )
                 break
         return all_markets
 

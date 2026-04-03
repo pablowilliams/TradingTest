@@ -1,6 +1,10 @@
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
+// NOTE (#100): This crate requires PyO3 0.20.x. If upgrading to PyO3 0.21+,
+// the module init signature changes from `fn trading_engine(_py: Python, m: &PyModule)`
+// to `fn trading_engine(m: &Bound<'_, PyModule>)`. See PyO3 migration guide.
+
 /// Fast orderbook processing
 #[pyclass]
 struct OrderbookProcessor {
@@ -58,6 +62,7 @@ impl OrderbookProcessor {
 }
 
 /// Fast signal combination for strategy decisions
+/// #74: base_sum is now a parameter instead of hardcoded 0.90
 #[pyfunction]
 fn combine_signals(
     market_price: f64,
@@ -68,8 +73,13 @@ fn combine_signals(
     learning_weight: f64,
     late_window_boost: f64,
     time_remaining: f64,
+    base_sum: f64,
 ) -> f64 {
-    let scale = (1.0 - learning_weight) / 0.90;
+    let scale = if base_sum > 0.0 {
+        (1.0 - learning_weight) / base_sum
+    } else {
+        1.0
+    };
     let mut combined = market_price * 0.50 * scale
         + btc_momentum * 0.15 * scale
         + pm_momentum * 0.10 * scale
@@ -83,6 +93,9 @@ fn combine_signals(
 }
 
 /// Soccer 3-way opportunity check
+/// #75: Accept draw_index as a parameter instead of guessing.
+///      If draw_index is out of range or negative, falls back to
+///      finding the middle-priced outcome.
 #[pyfunction]
 fn check_soccer_3way(
     prices: Vec<f64>,
@@ -90,6 +103,7 @@ fn check_soccer_3way(
     sell_threshold: f64,
     risk_threshold: f64,
     entry_combined: f64,
+    draw_index: i32,
 ) -> HashMap<String, f64> {
     let mut result = HashMap::new();
 
@@ -98,16 +112,24 @@ fn check_soccer_3way(
         return result;
     }
 
-    // Find favorite and draw (assume draw is index with middle value or last)
-    let mut indexed: Vec<(usize, f64)> = prices.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Determine the draw index
+    let actual_draw_idx: usize = if draw_index >= 0 && (draw_index as usize) < prices.len() {
+        draw_index as usize
+    } else {
+        // Fallback: assume draw is the middle-priced outcome
+        let mut indexed: Vec<(usize, f64)> = prices.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed[1].0
+    };
 
-    let fav_price = indexed[0].1;
-    let mid_price = indexed[1].1;
-    let low_price = indexed[2].1;
-
-    // Assume draw is the middle-priced outcome for simplicity
-    let combined = fav_price + mid_price;
+    // Sum the two non-draw outcomes (favorite + underdog)
+    let mut non_draw_sum = 0.0;
+    for (i, &p) in prices.iter().enumerate() {
+        if i != actual_draw_idx {
+            non_draw_sum += p;
+        }
+    }
+    let combined = non_draw_sum;
 
     if entry_combined == 0.0 && combined < buy_threshold {
         result.insert("action".to_string(), 1.0); // buy

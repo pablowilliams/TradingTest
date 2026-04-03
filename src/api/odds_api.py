@@ -7,6 +7,17 @@ logger = logging.getLogger(__name__)
 
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
+# Sports the bot actively trades, in priority order.
+# These are fetched first; remaining active sports follow after.
+PRIORITY_SPORTS = [
+    "americanfootball_nfl",
+    "basketball_nba",
+    "soccer_epl", "soccer_usa_mls", "soccer_spain_la_liga",
+    "soccer_germany_bundesliga", "soccer_italy_serie_a", "soccer_france_ligue_one",
+    "baseball_mlb",
+    "icehockey_nhl",
+]
+
 
 def american_to_implied_prob(odds: int) -> float:
     if odds > 0:
@@ -29,6 +40,9 @@ class OddsAPIClient:
         self.requests_used: int = 0
 
     async def __aenter__(self):
+        # NOTE: The Odds API does not support header-based authentication;
+        # the API key must be passed as a query parameter (?apiKey=...).
+        # See: https://the-odds-api.com/liveapi/guides/v4/
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
         return self
 
@@ -63,16 +77,42 @@ class OddsAPIClient:
         return await self._get(f"/sports/{sport_key}/events/{event_id}/odds", params)
 
     async def get_all_sport_odds(self) -> dict:
+        """Fetch odds for active sports, prioritising the ones the bot trades."""
         sports = await self.get_sports()
-        active = [s for s in sports if s.get("active") and not s.get("has_outrights")]
+        active_by_key = {s["key"]: s for s in sports if s.get("active")}
+
+        # Build ordered list: priority sports first, then the rest.
+        # Outright sports (futures / season-winner markets) are included but
+        # placed after head-to-head sports so they don't crowd out match odds.
+        ordered_keys: list[str] = []
+        for key in PRIORITY_SPORTS:
+            if key in active_by_key:
+                ordered_keys.append(key)
+
+        # Append remaining active sports (head-to-head first, outrights last)
+        for s in sports:
+            if not s.get("active"):
+                continue
+            if s["key"] in ordered_keys:
+                continue
+            if not s.get("has_outrights"):
+                ordered_keys.append(s["key"])
+        for s in sports:
+            if not s.get("active"):
+                continue
+            if s["key"] in ordered_keys:
+                continue
+            # has_outrights == True: still include, just at the end
+            ordered_keys.append(s["key"])
+
         all_odds = {}
-        for sport in active[:10]:
+        for key in ordered_keys[:15]:  # cap API usage
             try:
-                odds = await self.get_odds(sport["key"])
-                all_odds[sport["key"]] = {"title": sport.get("title", sport["key"]),
-                                          "events": odds}
+                odds = await self.get_odds(key)
+                all_odds[key] = {"title": active_by_key[key].get("title", key),
+                                 "events": odds}
             except Exception as e:
-                logger.warning(f"Failed odds for {sport['key']}: {e}")
+                logger.warning(f"Failed odds for {key}: {e}")
         return all_odds
 
     def extract_implied_probs(self, event: dict) -> dict:

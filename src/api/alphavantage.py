@@ -47,16 +47,19 @@ class AlphaVantageClient:
             return {}
 
     # --- Crypto Technical Indicators ---
+    # NOTE: Alpha Vantage DIGITAL_CURRENCY / crypto technical indicator functions
+    # expect just the crypto symbol (e.g. "BTC"), NOT a pair like "BTCUSD".
+    # The market is specified separately via the "market" parameter.
 
     async def get_crypto_rsi(self, symbol: str = "BTC", interval: str = "60min",
                               period: int = 14) -> dict:
         """RSI for crypto."""
         data = await self._get({
-            "function": "RSI", "symbol": f"{symbol}USD",
+            "function": "RSI", "symbol": symbol,
             "interval": interval, "time_period": period,
             "series_type": "close", "datatype": "json"
         })
-        values = list((data.get(f"Technical Analysis: RSI") or {}).values())
+        values = list((data.get("Technical Analysis: RSI") or {}).values())
         if values:
             rsi = float(values[0].get("RSI", 50))
             return {"rsi": round(rsi, 2),
@@ -66,7 +69,7 @@ class AlphaVantageClient:
     async def get_crypto_macd(self, symbol: str = "BTC", interval: str = "60min") -> dict:
         """MACD for crypto."""
         data = await self._get({
-            "function": "MACD", "symbol": f"{symbol}USD",
+            "function": "MACD", "symbol": symbol,
             "interval": interval, "series_type": "close"
         })
         values = list((data.get("Technical Analysis: MACD") or {}).values())
@@ -84,7 +87,7 @@ class AlphaVantageClient:
                                  period: int = 20) -> dict:
         """Bollinger Bands - detect squeeze/breakout."""
         data = await self._get({
-            "function": "BBANDS", "symbol": f"{symbol}USD",
+            "function": "BBANDS", "symbol": symbol,
             "interval": interval, "time_period": period,
             "series_type": "close", "nbdevup": 2, "nbdevdn": 2
         })
@@ -109,7 +112,7 @@ class AlphaVantageClient:
     async def get_crypto_stoch(self, symbol: str = "BTC", interval: str = "60min") -> dict:
         """Stochastic oscillator."""
         data = await self._get({
-            "function": "STOCH", "symbol": f"{symbol}USD", "interval": interval
+            "function": "STOCH", "symbol": symbol, "interval": interval
         })
         values = list((data.get("Technical Analysis: STOCH") or {}).values())
         if values:

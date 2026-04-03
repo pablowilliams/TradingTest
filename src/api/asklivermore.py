@@ -1,18 +1,41 @@
 """AskLivermore scraper for stock pattern signals."""
 import json
 import logging
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-COOKIE_PATH = Path(__file__).parent.parent.parent / ".asklivermore_cookies.json"
+# Store cookies in a safe, non-repo location (temp dir or .claude dir).
+_CLAUDE_DIR = Path.home() / ".claude"
+if _CLAUDE_DIR.is_dir():
+    COOKIE_PATH = _CLAUDE_DIR / "asklivermore_cookies.json"
+else:
+    COOKIE_PATH = Path(tempfile.gettempdir()) / "asklivermore_cookies.json"
+
+# Playwright is an optional dependency. Import errors are caught so the rest
+# of the codebase can load even when playwright is not installed.
+try:
+    from playwright.async_api import async_playwright
+    _HAS_PLAYWRIGHT = True
+except ImportError:
+    _HAS_PLAYWRIGHT = False
+    logger.info(
+        "playwright is not installed; AskLivermore scraper will be unavailable. "
+        "Install with: pip install playwright && playwright install chromium"
+    )
 
 
 class AskLivermore:
     """Scrape A+ stock signals from AskLivermore dashboard."""
 
     def __init__(self, email: str, password: str):
+        if not _HAS_PLAYWRIGHT:
+            raise RuntimeError(
+                "playwright is required for AskLivermore. "
+                "Install with: pip install playwright && playwright install chromium"
+            )
         self.email = email
         self.password = password
         self.browser = None
@@ -21,7 +44,6 @@ class AskLivermore:
         self.context = None
 
     async def __aenter__(self):
-        from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
         self.browser = await self._pw.chromium.launch(headless=True)
         context_opts = {}

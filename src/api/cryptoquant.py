@@ -46,7 +46,7 @@ class CryptoQuantClient:
 
     async def get_exchange_netflow(self, asset: str = "btc", window: str = "day") -> dict:
         """Get exchange net inflow/outflow. Inflow = selling pressure, outflow = accumulation."""
-        data = await self._get(f"/btc/exchange-flows/netflow",
+        data = await self._get(f"/{asset}/exchange-flows/netflow",
                                {"window": window, "limit": 1})
         results = data.get("result", {}).get("data", [])
         if not results:
@@ -74,7 +74,7 @@ class CryptoQuantClient:
 
     async def get_whale_transactions(self, asset: str = "btc") -> dict:
         """Track large whale transactions."""
-        data = await self._get(f"/btc/network-data/transactions-count-large",
+        data = await self._get(f"/{asset}/network-data/transactions-count-large",
                                {"window": "day", "limit": 2})
         results = data.get("result", {}).get("data", [])
         if len(results) < 2:
@@ -101,7 +101,7 @@ class CryptoQuantClient:
 
     async def get_miner_outflow(self, asset: str = "btc") -> dict:
         """Track miner selling pressure."""
-        data = await self._get(f"/btc/miner-flows/outflow",
+        data = await self._get(f"/{asset}/miner-flows/outflow",
                                {"window": "day", "limit": 2})
         results = data.get("result", {}).get("data", [])
         if len(results) < 2:

@@ -14,6 +14,13 @@ class OrderflowSignal:
             bids = book.get("bids", [])
             asks = book.get("asks", [])
 
+            # Handle empty orderbook gracefully
+            if not bids and not asks:
+                logger.warning(f"Empty orderbook for token {token_id}")
+                return {"imbalance": 0, "spread": 1, "volume_pressure": 0,
+                        "total_bid_size": 0, "total_ask_size": 0,
+                        "best_bid": 0, "best_ask": 1, "empty_book": True}
+
             total_bid = sum(float(b.get("size", 0)) for b in bids)
             total_ask = sum(float(a.get("size", 0)) for a in asks)
             total = total_bid + total_ask
@@ -33,8 +40,9 @@ class OrderflowSignal:
             return {"imbalance": round(imbalance, 4), "spread": round(spread, 4),
                     "volume_pressure": round(vol_pressure, 4),
                     "total_bid_size": round(total_bid, 2), "total_ask_size": round(total_ask, 2),
-                    "best_bid": best_bid, "best_ask": best_ask}
+                    "best_bid": best_bid, "best_ask": best_ask, "empty_book": False}
         except Exception as e:
             logger.error(f"Orderflow error: {e}")
             return {"imbalance": 0, "spread": 1, "volume_pressure": 0,
-                    "total_bid_size": 0, "total_ask_size": 0, "best_bid": 0, "best_ask": 1}
+                    "total_bid_size": 0, "total_ask_size": 0, "best_bid": 0, "best_ask": 1,
+                    "empty_book": True}

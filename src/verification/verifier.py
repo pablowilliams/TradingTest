@@ -9,7 +9,10 @@ class TradeVerifier:
     """Multi-check verification gate before any trade is placed."""
 
     def __init__(self, config: dict, db=None):
-        self.min_confidence = config.get("min_confidence", 0.60)
+        # #20 FIX: lowered from 0.60 to 0.35 -- strategies now output
+        # full-range confidence (cap raised to 0.85), so the old 0.60
+        # floor blocked almost every trade.
+        self.min_confidence = config.get("min_confidence", 0.35)
         self.min_signals_agree = config.get("min_signals_agree", 3)
         self.require_positive_ev = config.get("require_positive_ev", True)
         self.max_spread = config.get("max_spread", 0.05)
@@ -72,12 +75,14 @@ class TradeVerifier:
                 reasons.append("Insufficient cross-validation")
 
         # 7. Anti-tilt check: no more than 3 consecutive losses
+        # #28 FIX: filter to only the current bot's recent trades, not all bots
         if self.db:
-            recent = await self.db.get_recent_trades(limit=3)
+            bot_id = decision.get("bot_id", "")
+            recent = await self.db.get_recent_trades(bot_id=bot_id, limit=3)
             consec_losses = sum(1 for t in recent if t.get("pnl", 0) < 0)
             checks["not_tilting"] = consec_losses < 3
             if not checks["not_tilting"]:
-                reasons.append(f"Tilt guard: {consec_losses} consecutive losses")
+                reasons.append(f"Tilt guard: {consec_losses} consecutive losses for {bot_id}")
 
         passed = all(checks.values())
         result = {

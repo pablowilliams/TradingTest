@@ -36,7 +36,8 @@ class TelegramNotifier:
                 "chat_id": self.chat_id, "text": message,
                 "parse_mode": parse_mode, "disable_web_page_preview": True})
         except Exception as e:
-            logger.error(f"Telegram send failed: {e}")
+            # #98: Don't include bot token in error messages/logs
+            logger.error(f"Telegram send failed: {type(e).__name__}: {_sanitize_error(e, self.bot_token)}")
 
     async def notify_buy(self, bot_id: str, market: str, outcome: str,
                          amount: float, price: float, confidence: float, reasoning: str):
@@ -93,3 +94,11 @@ class TelegramNotifier:
         for s in signals[:10]:
             lines.append(f"<b>{s['ticker']}</b> ${s['price']:.2f} — {s['pattern']} [{s['grade']}]")
         await self.send(header + "\n".join(lines))
+
+
+def _sanitize_error(e: Exception, token: str) -> str:
+    """Remove bot token from error strings to avoid leaking it in logs."""
+    msg = str(e)
+    if token:
+        msg = msg.replace(token, "<REDACTED>")
+    return msg

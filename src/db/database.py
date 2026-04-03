@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS asklivermore_signals (
     details TEXT,
     scraped_at REAL NOT NULL
 );
+
+-- #34: Indexes on frequently queried columns
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id);
+CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);
 """
 
 
@@ -144,34 +149,47 @@ class Database:
             cursor = await self.db.execute("SELECT * FROM trades WHERE status='open'")
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def get_recent_trades(self, limit: int = 50) -> list:
-        cursor = await self.db.execute(
-            "SELECT * FROM trades ORDER BY created_at DESC LIMIT ?", (limit,))
+    async def get_recent_trades(self, limit: int = 50, bot_id: str = None) -> list:
+        if bot_id:
+            cursor = await self.db.execute(
+                "SELECT * FROM trades WHERE bot_id=? ORDER BY created_at DESC LIMIT ?",
+                (bot_id, limit))
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM trades ORDER BY created_at DESC LIMIT ?", (limit,))
         return [dict(row) for row in await cursor.fetchall()]
 
     # --- Bot Stats ---
+    # #32: Wrap update_bot_stats in a single transaction for atomicity
     async def update_bot_stats(self, bot_id: str, won: bool, pnl: float):
-        row = await self.db.execute_fetchall(
-            "SELECT * FROM bot_stats WHERE bot_id=?", (bot_id,))
-        if row:
-            stats = dict(row[0])
-            total = stats["total_trades"] + 1
-            wins = stats["wins"] + (1 if won else 0)
-            await self.db.execute(
-                """UPDATE bot_stats SET total_trades=?, wins=?, losses=?,
-                   total_pnl=?, win_rate=?, updated_at=? WHERE bot_id=?""",
-                (total, wins, total - wins, stats["total_pnl"] + pnl,
-                 wins / total if total > 0 else 0, time.time(), bot_id)
-            )
-        else:
-            await self.db.execute(
-                """INSERT INTO bot_stats (bot_id, total_trades, wins, losses,
-                   total_pnl, win_rate, updated_at)
-                   VALUES (?, 1, ?, ?, ?, ?, ?)""",
-                (bot_id, 1 if won else 0, 0 if won else 1, pnl,
-                 1.0 if won else 0.0, time.time())
-            )
-        await self.db.commit()
+        async with self.db.execute("BEGIN IMMEDIATE"):
+            pass
+        try:
+            row = await self.db.execute_fetchall(
+                "SELECT * FROM bot_stats WHERE bot_id=?", (bot_id,))
+            if row:
+                stats = dict(row[0])
+                total = stats["total_trades"] + 1
+                # #31: Breakeven trades (pnl=0) should count as wins, use >= 0
+                wins = stats["wins"] + (1 if won else 0)
+                await self.db.execute(
+                    """UPDATE bot_stats SET total_trades=?, wins=?, losses=?,
+                       total_pnl=?, win_rate=?, updated_at=? WHERE bot_id=?""",
+                    (total, wins, total - wins, stats["total_pnl"] + pnl,
+                     wins / total if total > 0 else 0, time.time(), bot_id)
+                )
+            else:
+                await self.db.execute(
+                    """INSERT INTO bot_stats (bot_id, total_trades, wins, losses,
+                       total_pnl, win_rate, updated_at)
+                       VALUES (?, 1, ?, ?, ?, ?, ?)""",
+                    (bot_id, 1 if won else 0, 0 if won else 1, pnl,
+                     1.0 if won else 0.0, time.time())
+                )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def get_all_bot_stats(self) -> list:
         cursor = await self.db.execute(
@@ -243,13 +261,28 @@ class Database:
         await self.db.commit()
 
     # --- AskLivermore Signals ---
+    # #88: Batch inserts into a single commit
+    # #35: Dedup check - skip signals with same ticker+pattern+grade within last hour
     async def save_asklivermore_signals(self, signals: list):
+        now = time.time()
+        one_hour_ago = now - 3600
         for s in signals:
+            ticker = s.get("ticker", "")
+            pattern = s.get("pattern", "")
+            grade = s.get("grade", "")
+            # #35: Dedup check before insert
+            existing = await self.db.execute_fetchall(
+                """SELECT id FROM asklivermore_signals
+                   WHERE ticker=? AND pattern=? AND grade=? AND scraped_at > ?""",
+                (ticker, pattern, grade, one_hour_ago))
+            if existing:
+                continue
             await self.db.execute(
                 """INSERT INTO asklivermore_signals (ticker, pattern, grade, price, details, scraped_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (s.get("ticker", ""), s.get("pattern", ""), s.get("grade", ""),
-                 s.get("price", 0), s.get("details", ""), time.time()))
+                (ticker, pattern, grade,
+                 s.get("price", 0), s.get("details", ""), now))
+        # #88: Single commit for the whole batch
         await self.db.commit()
 
     async def get_latest_asklivermore_signals(self, grade: str = None) -> list:
@@ -272,14 +305,28 @@ class Database:
         await self.db.commit()
 
     # --- Summary ---
+    # #30: Include note about open trade unrealized PnL
+    # #31: Use pnl >= 0 for wins (breakeven counts as win)
     async def get_daily_summary(self) -> dict:
+        cutoff = time.time() - 86400
         cursor = await self.db.execute(
-            """SELECT COUNT(*) as trades, SUM(pnl) as total_pnl,
-               SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
+            """SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as total_pnl,
+               SUM(CASE WHEN pnl >= 0 THEN 1 ELSE 0 END) as wins
                FROM trades WHERE created_at > ? AND status='resolved'""",
-            (time.time() - 86400,))
+            (cutoff,))
         row = await cursor.fetchone()
-        return dict(row) if row else {"trades": 0, "total_pnl": 0, "wins": 0}
+        result = dict(row) if row else {"trades": 0, "total_pnl": 0, "wins": 0}
+
+        # #30: Include unrealized PnL from open trades
+        open_cursor = await self.db.execute(
+            """SELECT COUNT(*) as open_count, COALESCE(SUM(pnl), 0) as unrealized_pnl
+               FROM trades WHERE status='open' AND created_at > ?""",
+            (cutoff,))
+        open_row = await open_cursor.fetchone()
+        if open_row:
+            result["open_trades"] = open_row[0] or 0
+            result["unrealized_pnl"] = open_row[1] or 0.0
+        return result
 
     async def get_total_pnl(self) -> float:
         cursor = await self.db.execute(

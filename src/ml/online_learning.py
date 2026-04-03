@@ -1,4 +1,5 @@
 """Online learning - continuous model improvement from trade outcomes."""
+import json
 import logging
 import numpy as np
 from typing import Optional
@@ -18,7 +19,15 @@ class OnlineLearner:
 
     async def record_outcome(self, trade: dict, won: bool, pnl: float):
         """Record a trade outcome for learning."""
-        features = self.scorer.extract_features(trade.get("signals_snapshot", trade))
+        # #16: Parse signals_snapshot from JSON string if needed
+        signals = trade.get("signals_snapshot", trade)
+        if isinstance(signals, str):
+            try:
+                signals = json.loads(signals)
+            except (json.JSONDecodeError, TypeError):
+                signals = trade
+
+        features = self.scorer.extract_features(signals)
         outcome = 1.0 if won else 0.0
 
         self._buffer_X.append(features.flatten())
@@ -49,6 +58,13 @@ class OnlineLearner:
     def _extract_feature_keys(self, trade: dict) -> list:
         """Extract Bayesian feature bucket keys from a trade."""
         snap = trade.get("signals_snapshot", {})
+        # #16: Also parse here if it's a JSON string
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except (json.JSONDecodeError, TypeError):
+                snap = {}
+
         keys = []
         price = snap.get("yes_price", snap.get("pm_price", 0.5))
         if price < 0.40: keys.append("price_low")

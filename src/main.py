@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from .config import Config
 from .db.database import Database
@@ -34,10 +35,14 @@ from .ml.xgboost_model import OpportunityScorer
 from .ml.online_learning import OnlineLearner
 from .arena.arena import Arena
 
+# #11: Use absolute path for log file based on project dir
+_PROJECT_DIR = Path(__file__).parent.parent
+_LOG_FILE = _PROJECT_DIR / "trading.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("trading.log")])
+    handlers=[logging.StreamHandler(), logging.FileHandler(str(_LOG_FILE))])
 
 logger = logging.getLogger(__name__)
 
@@ -56,66 +61,121 @@ async def run_bot(config: Config):
     pos_mgr = PositionManager(config.risk)
     sentiment = SentimentScorer(config.newsapi_key) if config.newsapi_key else None
 
-    async with PolymarketClient() as pm_client:
+    # #13: Wrap client initialization in proper try/except
+    # #79: Add proper error handling for client setup
+    pm_client = None
+    simmer = None
+    odds_client = None
+    coinglass = None
+    polygon = None
+    cryptoquant = None
+    twitter = None
+    alphavantage = None
+    asklivermore = None
+
+    try:
+        pm_client = PolymarketClient()
+        await pm_client.__aenter__()
+    except Exception as e:
+        logger.error(f"Failed to initialize Polymarket client: {e}")
+        await db.close()
+        raise
+
+    try:
         # Paper trading client
-        simmer = None
         if config.mode == "paper" and config.simmer_api_key:
-            simmer = SimmerClient(config.simmer_api_key)
-            await simmer.__aenter__()
+            try:
+                simmer = SimmerClient(config.simmer_api_key)
+                await simmer.__aenter__()
+            except Exception as e:
+                logger.warning(f"Failed to initialize Simmer client: {e}")
+                simmer = None
+
+        # #53: When mode="live", use Polymarket CLOB for order placement
+        if config.mode == "live":
+            if not pm_client.clob:
+                logger.warning(
+                    "Live mode requires Polymarket CLOB client. "
+                    "Ensure POLYMARKET_API_KEY, POLYMARKET_API_SECRET, "
+                    "POLYMARKET_PRIVATE_KEY, and POLYMARKET_API_PASSPHRASE are set."
+                )
+            else:
+                logger.info("Live mode: Polymarket CLOB client ready for order placement")
 
         # Odds API
-        odds_client = None
         if config.odds_api_key:
-            odds_client = OddsAPIClient(config.odds_api_key)
-            await odds_client.__aenter__()
-            logger.info("Odds API connected")
+            try:
+                odds_client = OddsAPIClient(config.odds_api_key)
+                await odds_client.__aenter__()
+                logger.info("Odds API connected")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Odds API client: {e}")
+                odds_client = None
 
         # --- 5 NEW ENHANCED API CLIENTS ---
 
         # 1. Coinglass - derivatives data
-        coinglass = None
         if config.coinglass_api_key:
-            coinglass = CoinglassClient(config.coinglass_api_key)
-            await coinglass.__aenter__()
-            logger.info("Coinglass connected (funding, liquidations, OI, L/S ratio)")
+            try:
+                coinglass = CoinglassClient(config.coinglass_api_key)
+                await coinglass.__aenter__()
+                logger.info("Coinglass connected (funding, liquidations, OI, L/S ratio)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Coinglass client: {e}")
+                coinglass = None
 
         # 2. Polygon.io - technicals + enrichment
-        polygon = None
         if config.polygonio_api_key:
-            polygon = PolygonClient(config.polygonio_api_key)
-            await polygon.__aenter__()
-            logger.info("Polygon.io connected (RSI, MACD, VWAP, Bollinger)")
+            try:
+                polygon = PolygonClient(config.polygonio_api_key)
+                await polygon.__aenter__()
+                logger.info("Polygon.io connected (RSI, MACD, VWAP, Bollinger)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Polygon client: {e}")
+                polygon = None
 
         # 3. CryptoQuant - on-chain analytics
-        cryptoquant = None
         cq_key = getattr(config, 'cryptoquant_api_key', '') or ''
         if cq_key:
-            cryptoquant = CryptoQuantClient(cq_key)
-            await cryptoquant.__aenter__()
-            logger.info("CryptoQuant connected (exchange flows, whales, miners)")
+            try:
+                cryptoquant = CryptoQuantClient(cq_key)
+                await cryptoquant.__aenter__()
+                logger.info("CryptoQuant connected (exchange flows, whales, miners)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize CryptoQuant client: {e}")
+                cryptoquant = None
 
         # 4. Twitter/X - social sentiment
-        twitter = None
         tw_key = getattr(config, 'twitter_bearer_token', '') or ''
         if tw_key:
-            twitter = TwitterSentiment(tw_key)
-            await twitter.__aenter__()
-            logger.info("Twitter connected (crypto + sports sentiment, fear/greed)")
+            try:
+                twitter = TwitterSentiment(tw_key)
+                await twitter.__aenter__()
+                logger.info("Twitter connected (crypto + sports sentiment, fear/greed)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Twitter client: {e}")
+                twitter = None
 
         # 5. Alpha Vantage - additional technicals
-        alphavantage = None
         av_key = getattr(config, 'alphavantage_key', '') or ''
         if av_key:
-            alphavantage = AlphaVantageClient(av_key)
-            await alphavantage.__aenter__()
-            logger.info("Alpha Vantage connected (RSI, MACD, BBands, Stochastic)")
+            try:
+                alphavantage = AlphaVantageClient(av_key)
+                await alphavantage.__aenter__()
+                logger.info("Alpha Vantage connected (RSI, MACD, BBands, Stochastic)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Alpha Vantage client: {e}")
+                alphavantage = None
 
         # AskLivermore scraper
-        asklivermore = None
         if config.asklivermore_email and config.asklivermore_password:
-            asklivermore = AskLivermore(config.asklivermore_email, config.asklivermore_password)
-            await asklivermore.__aenter__()
-            logger.info("AskLivermore scraper connected")
+            try:
+                asklivermore = AskLivermore(config.asklivermore_email, config.asklivermore_password)
+                await asklivermore.__aenter__()
+                logger.info("AskLivermore scraper connected")
+            except Exception as e:
+                logger.warning(f"Failed to initialize AskLivermore scraper: {e}")
+                asklivermore = None
 
         # Signal processors
         orderflow = OrderflowSignal(pm_client.clob) if pm_client.clob else None
@@ -164,22 +224,29 @@ async def run_bot(config: Config):
             except Exception:
                 pass
 
-            # Cleanup all clients
-            for client in [simmer, odds_client, coinglass, polygon,
-                           cryptoquant, twitter, alphavantage, asklivermore]:
-                if client:
-                    try:
-                        await client.__aexit__(None, None, None)
-                    except Exception:
-                        pass
+    finally:
+        # Cleanup all clients
+        for client in [simmer, odds_client, coinglass, polygon,
+                       cryptoquant, twitter, alphavantage, asklivermore]:
+            if client:
+                try:
+                    await client.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
+        if pm_client:
             try:
-                summary = await db.get_daily_summary()
-                await telegram.notify_daily_summary(summary)
-                await telegram.close()
+                await pm_client.__aexit__(None, None, None)
             except Exception:
                 pass
-            await db.close()
+
+        try:
+            summary = await db.get_daily_summary()
+            await telegram.notify_daily_summary(summary)
+            await telegram.close()
+        except Exception:
+            pass
+        await db.close()
 
 
 async def run_dashboard(config: Config):
