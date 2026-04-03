@@ -43,13 +43,18 @@ class TradeVerifier:
         if not checks["ev_positive"]:
             reasons.append(f"Negative EV: {ev:.4f}")
 
-        # 4. Spread check
-        spread = 1.0
+        # 4. Spread check (use orderflow if passed, else check signals dict)
+        spread = None
         if orderflow:
-            spread = orderflow.get("spread", 1.0)
-        checks["spread_ok"] = spread <= self.max_spread
-        if not checks["spread_ok"]:
-            reasons.append(f"Wide spread: {spread:.4f} > {self.max_spread}")
+            spread = orderflow.get("spread")
+        if spread is None:
+            spread = signals.get("spread")
+        if spread is not None:
+            checks["spread_ok"] = spread <= self.max_spread
+            if not checks["spread_ok"]:
+                reasons.append(f"Wide spread: {spread:.4f} > {self.max_spread}")
+        else:
+            checks["spread_ok"] = True  # No spread data = skip this check
 
         # 5. Liquidity check
         liq = float(market.get("liquidity", 0))

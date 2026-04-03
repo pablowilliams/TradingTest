@@ -1,4 +1,5 @@
 """Base strategy with signal combination, Bayesian learning, and bet sizing."""
+import json
 import math
 import random
 import time
@@ -78,10 +79,13 @@ class BaseStrategy(ABC):
         return max(-1.0, min(1.0, total_bias / total_weight)) if total_weight else 0.0
 
     def bet_size(self, confidence: float, balance: float, max_pos: float = 50.0) -> float:
-        if confidence <= 0:
-            return 0.0
-        kelly = (2 * confidence - 1) * 0.25
-        return max(1.0, min(balance * kelly, max_pos))
+        if confidence <= 0.5:
+            return 0.0  # Sub-breakeven confidence = no bet
+        kelly = (2 * confidence - 1) * 0.25  # Quarter-Kelly
+        size = balance * kelly
+        if size < 1.0:
+            return 0.0  # Too small to be worth it
+        return min(size, max_pos)
 
     def mutate(self, mutation_range: float = 0.15) -> dict:
         new = dict(self.params)
@@ -102,9 +106,8 @@ class BaseStrategy(ABC):
             return float(p)
         prices = market.get("outcomePrices", [0.5])
         if isinstance(prices, str):
-            import json
             try: prices = json.loads(prices)
-            except: return 0.5
+            except (json.JSONDecodeError, TypeError): return 0.5
         return float(prices[0]) if prices else 0.5
 
     def _market_price_signal(self, p: float) -> float:

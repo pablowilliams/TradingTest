@@ -15,16 +15,26 @@ class TelegramNotifier:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = bool(bot_token and chat_id)
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     async def send(self, message: str, parse_mode: str = "HTML"):
         if not self.enabled:
             return
         try:
             url = TELEGRAM_API.format(token=self.bot_token)
-            async with aiohttp.ClientSession() as session:
-                await session.post(url, json={
-                    "chat_id": self.chat_id, "text": message,
-                    "parse_mode": parse_mode, "disable_web_page_preview": True})
+            session = await self._get_session()
+            await session.post(url, json={
+                "chat_id": self.chat_id, "text": message,
+                "parse_mode": parse_mode, "disable_web_page_preview": True})
         except Exception as e:
             logger.error(f"Telegram send failed: {e}")
 
@@ -56,13 +66,16 @@ class TelegramNotifier:
         await self.send(msg)
 
     async def notify_daily_summary(self, stats: dict):
-        pnl = stats.get("total_pnl", 0)
+        pnl = stats.get("total_pnl", 0) or 0
+        trades = stats.get("trades", 0) or 0
+        wins = stats.get("wins", 0) or 0
+        wr = wins / trades if trades > 0 else 0
         emoji = "📈" if pnl >= 0 else "📉"
         msg = (f"{emoji} <b>DAILY SUMMARY</b>\n"
-               f"Trades: {stats.get('trades', 0)}\n"
-               f"Wins: {stats.get('wins', 0)}\n"
+               f"Trades: {trades}\n"
+               f"Wins: {wins}\n"
                f"P&L: <b>${pnl:+.2f}</b>\n"
-               f"Win Rate: {stats.get('win_rate', 0):.1%}")
+               f"Win Rate: {wr:.1%}")
         await self.send(msg)
 
     async def notify_evolution(self, killed: str, replaced_by: str, reason: str):

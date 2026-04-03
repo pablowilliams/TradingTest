@@ -339,9 +339,15 @@ class Arena:
                         pass
 
                 # --- Run each bot ---
-                for bot_id, bot in self.bots.items():
+                # Max concurrent trades check
+                open_trades = await self.db.get_open_trades()
+                max_concurrent = self.config.risk.get("max_concurrent_trades", 5)
+                if len(open_trades) >= max_concurrent:
+                    continue  # Skip this market, at capacity
+
+                for bot_id, bot in list(self.bots.items()):
                     try:
-                        # Circuit breaker check (PDF: 4 consecutive losses = suspension)
+                        # Circuit breaker (PDF: 4 consecutive losses = suspension)
                         if bot_id in self._suspended_until:
                             if time.time() < self._suspended_until[bot_id]:
                                 continue
@@ -358,15 +364,33 @@ class Arena:
                                 and signals.get("regime") == "trending"):
                             continue
 
-                        # Inject mega composite as additional signal
+                        # Inject mega composite
                         signals["mega_signal"] = signals.get("mega_composite", 0)
 
                         decision = bot.make_decision(market, signals)
                         if decision["action"] == "hold":
                             continue
 
-                        # Verify trade (7-check gate)
-                        verification = await self.verifier.verify(decision, market, signals)
+                        # Skip soccer combo actions that Simmer can't handle
+                        if decision["action"] in ("buy_combo", "sell_combo", "flip_team"):
+                            # Log but don't execute through normal path
+                            logger.info(f"Soccer 3-way signal: {decision['action']} - "
+                                        f"{decision.get('reasoning', '')}")
+                            if self.config.telegram.get("notify_on_buy"):
+                                await self.telegram.send(
+                                    f"⚽ <b>SOCCER 3-WAY</b>\n"
+                                    f"Action: {decision['action']}\n"
+                                    f"{decision.get('reasoning', '')[:100]}")
+                            continue  # TODO: implement combo execution for live CLOB
+
+                        # Verify trade (pass orderflow signals for spread check)
+                        orderflow_data = {
+                            "spread": signals.get("spread"),
+                            "imbalance": signals.get("orderflow_imbalance", 0)
+                        } if signals.get("spread") is not None else None
+
+                        verification = await self.verifier.verify(
+                            decision, market, signals, orderflow=orderflow_data)
                         if not verification["passed"]:
                             if self.config.telegram.get("notify_on_verification_fail"):
                                 await self.telegram.notify_verification_fail(
@@ -379,15 +403,20 @@ class Arena:
                         total_pnl = await self.db.get_total_pnl()
                         peak = max(balance, balance + total_pnl)
                         current_equity = balance + total_pnl
-                        if current_equity < peak * 0.70:
-                            logger.warning(f"Balance floor hit: {current_equity:.2f} < 70% of peak {peak:.2f}")
+                        floor_pct = self.config.risk.get("balance_floor_pct", 0.70)
+                        if current_equity < peak * floor_pct:
+                            logger.warning(f"Balance floor hit: {current_equity:.2f} < {floor_pct:.0%} of peak {peak:.2f}")
                             continue
 
-                        # Size with quarter-Kelly, 5% max cap (PDF recommendation)
+                        # Size with quarter-Kelly, max bet % cap
+                        max_bet_pct = self.config.risk.get("max_bet_pct", 0.05)
                         amount = bot.bet_size(
                             decision["confidence"], current_equity,
                             min(self.config.risk.get("max_position_size", 50),
-                                current_equity * 0.05))
+                                current_equity * max_bet_pct))
+
+                        if amount <= 0:
+                            continue  # Confidence too low for any bet
 
                         if not self.pos_mgr.check_daily_limit():
                             logger.warning("Daily loss cap hit")
@@ -508,7 +537,9 @@ class Arena:
                     continue
 
                 new_params = parent_bot.mutate()
-                new_id = f"{parent_bot.strategy_name}-v{random.randint(2, 99)}"
+                # Unique ID: strategy-gen-timestamp to avoid collisions
+                gen = parent_bot.generation + 1
+                new_id = f"{parent_bot.strategy_name}-g{gen}-{int(time.time()) % 10000}"
                 cls = STRATEGY_MAP.get(parent_bot.strategy_name)
                 if cls:
                     self.bots.pop(loser["bot_id"], None)

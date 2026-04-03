@@ -1,6 +1,9 @@
 """Soccer 3-way strategy - buys undervalued favorite + draw combos."""
 import json
+import logging
 from .base import BaseStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class Soccer3WayStrategy(BaseStrategy):
@@ -19,10 +22,10 @@ class Soccer3WayStrategy(BaseStrategy):
         prices = market.get("outcomePrices", [])
         if isinstance(outcomes, str):
             try: outcomes = json.loads(outcomes)
-            except: return self._hold("Cannot parse outcomes")
+            except (json.JSONDecodeError, TypeError): return self._hold("Cannot parse outcomes")
         if isinstance(prices, str):
             try: prices = json.loads(prices)
-            except: return self._hold("Cannot parse prices")
+            except (json.JSONDecodeError, TypeError): return self._hold("Cannot parse prices")
 
         if len(outcomes) != 3 or len(prices) < 3:
             return self._hold("Not a 3-outcome market")

@@ -147,10 +147,13 @@ async def run_bot(config: Config):
 
         try:
             await arena.run()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("Shutting down...")
         finally:
-            await arena.stop()
+            try:
+                await arena.stop()
+            except Exception:
+                pass
 
             # Cleanup all clients
             for client in [simmer, odds_client, coinglass, polygon,
@@ -161,8 +164,12 @@ async def run_bot(config: Config):
                     except Exception:
                         pass
 
-            summary = await db.get_daily_summary()
-            await telegram.notify_daily_summary(summary)
+            try:
+                summary = await db.get_daily_summary()
+                await telegram.notify_daily_summary(summary)
+                await telegram.close()
+            except Exception:
+                pass
             await db.close()
 
 
@@ -192,12 +199,15 @@ def main():
     if args.live:
         config.mode = "live"
 
-    if args.dashboard:
-        asyncio.run(run_dashboard(config))
-    elif args.bot_only:
-        asyncio.run(run_bot(config))
-    else:
-        asyncio.run(run_all(config))
+    try:
+        if args.dashboard:
+            asyncio.run(run_dashboard(config))
+        elif args.bot_only:
+            asyncio.run(run_bot(config))
+        else:
+            asyncio.run(run_all(config))
+    except KeyboardInterrupt:
+        logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":

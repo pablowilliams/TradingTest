@@ -35,13 +35,19 @@
 
   "risk": {
     "max_position_size": 50.0,
+    "daily_loss_cap": 100.0,
+    "balance_floor_pct": 0.70,
     "confidence_cap": 0.45,
     "no_bet_ban": true,
     "high_price_guard": 0.72,
     "low_price_guard": 0.35,
     "scale_out_method": "proportional",
     "stop_loss_pct": 0.13,
-    "late_window_boost": 0.25
+    "late_window_boost": 0.25,
+    "max_bet_pct": 0.05,
+    "max_concurrent_trades": 5,
+    "circuit_breaker_losses": 4,
+    "circuit_breaker_cooldown_sec": 300
   },
 
   "verification": {
