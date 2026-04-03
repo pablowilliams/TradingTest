@@ -52,6 +52,9 @@ class Config:
     newsapi_key: str = ""
     coinglass_api_key: str = ""
     polygonio_api_key: str = ""
+    cryptoquant_api_key: str = ""
+    twitter_bearer_token: str = ""
+    alphavantage_key: str = ""
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "Config":
@@ -61,7 +64,7 @@ class Config:
 
         config = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
-        # Load API keys from environment
+        # Load ALL API keys from environment
         config.polymarket_api_key = os.getenv("POLYMARKET_API_KEY", "")
         config.polymarket_api_secret = os.getenv("POLYMARKET_API_SECRET", "")
         config.polymarket_private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
@@ -74,6 +77,9 @@ class Config:
         config.newsapi_key = os.getenv("NEWSAPI_KEY", "")
         config.coinglass_api_key = os.getenv("COINGLASS_API_KEY", "")
         config.polygonio_api_key = os.getenv("POLYGONIO_API_KEY", "")
+        config.cryptoquant_api_key = os.getenv("CRYPTOQUANT_API_KEY", "")
+        config.twitter_bearer_token = os.getenv("TWITTER_BEARER_TOKEN", "")
+        config.alphavantage_key = os.getenv("ALPHAVANTAGE_KEY", "")
 
         return config
 
