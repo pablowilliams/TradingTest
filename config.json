@@ -1,0 +1,90 @@
+{
+  "mode": "paper",
+  "paper_balance": 1000.0,
+  "live_trade_limit": 10.0,
+  "daily_loss_cap": 100.0,
+  "max_concurrent_trades": 5,
+  "poll_interval_seconds": 15,
+  "resolution_check_seconds": 60,
+  "evolution_interval_seconds": 7200,
+
+  "market_types": {
+    "sports": true,
+    "crypto_5min": true,
+    "politics": true,
+    "all_events": true
+  },
+
+  "strategies": {
+    "momentum": {"enabled": true, "weight": 0.20},
+    "mean_reversion": {"enabled": true, "weight": 0.15},
+    "sports_edge": {"enabled": true, "weight": 0.25},
+    "soccer_3way": {"enabled": true, "weight": 0.20},
+    "sniper": {"enabled": true, "weight": 0.10},
+    "hybrid": {"enabled": true, "weight": 0.10}
+  },
+
+  "signals": {
+    "market_price_weight": 0.50,
+    "btc_momentum_weight": 0.15,
+    "pm_momentum_weight": 0.10,
+    "strategy_weight": 0.15,
+    "learning_weight_min": 0.05,
+    "learning_weight_max": 0.30
+  },
+
+  "risk": {
+    "max_position_size": 50.0,
+    "confidence_cap": 0.45,
+    "no_bet_ban": true,
+    "high_price_guard": 0.72,
+    "low_price_guard": 0.35,
+    "scale_out_method": "proportional",
+    "stop_loss_pct": 0.13,
+    "late_window_boost": 0.25
+  },
+
+  "verification": {
+    "min_confidence": 0.60,
+    "min_signals_agree": 3,
+    "require_positive_ev": true,
+    "max_spread": 0.05,
+    "min_liquidity": 1000,
+    "cross_validate": true
+  },
+
+  "evolution": {
+    "min_trades_for_eval": 20,
+    "survival_win_rate": 0.65,
+    "mutation_range": 0.15,
+    "mutation_params": 3
+  },
+
+  "telegram": {
+    "enabled": true,
+    "notify_on_buy": true,
+    "notify_on_sell": true,
+    "notify_on_verification_fail": true,
+    "notify_daily_summary": true
+  },
+
+  "dashboard": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "auto_refresh_seconds": 10
+  },
+
+  "sportsbook": {
+    "delta_cap": 0.03,
+    "min_match_confidence": 0.80,
+    "min_liquidity": 1000,
+    "excluded_books": ["BetRivers", "Bovada", "MyBookie"]
+  },
+
+  "soccer": {
+    "buy_threshold": 0.95,
+    "sell_profit_threshold": 0.99,
+    "risk_reduce_threshold": 0.13,
+    "poll_interval_ms": 200
+  }
+}

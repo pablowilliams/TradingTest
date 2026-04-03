@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+*.db
+venv/
+.venv/
+node_modules/
+target/
+*.so
+*.dylib
+.asklivermore_cookies.json
+models/*.json
+trading.log
+*.png
+*.jpeg
+*.jpg
+.DS_Store
