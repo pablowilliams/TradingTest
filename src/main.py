@@ -21,6 +21,7 @@ from .api.polygonio import PolygonClient
 from .api.cryptoquant import CryptoQuantClient
 from .api.twitter_sentiment import TwitterSentiment
 from .api.alphavantage import AlphaVantageClient
+from .api.asklivermore import AskLivermore
 from .signals.price_feed import PriceFeed
 from .signals.sentiment import SentimentScorer
 from .signals.orderflow import OrderflowSignal
@@ -109,6 +110,13 @@ async def run_bot(config: Config):
             await alphavantage.__aenter__()
             logger.info("Alpha Vantage connected (RSI, MACD, BBands, Stochastic)")
 
+        # AskLivermore scraper
+        asklivermore = None
+        if config.asklivermore_email and config.asklivermore_password:
+            asklivermore = AskLivermore(config.asklivermore_email, config.asklivermore_password)
+            await asklivermore.__aenter__()
+            logger.info("AskLivermore scraper connected")
+
         # Signal processors
         orderflow = OrderflowSignal(pm_client.clob) if pm_client.clob else None
         pm_momentum = PolymarketMomentum(pm_client.clob) if pm_client.clob else None
@@ -126,12 +134,13 @@ async def run_bot(config: Config):
             coinglass=coinglass, polygon=polygon, cryptoquant=cryptoquant,
             twitter=twitter, alphavantage=alphavantage, odds_client=odds_client,
             sentiment_scorer=sentiment, orderflow_signal=orderflow,
-            sportsbook_edge=sb_edge, pm_momentum=pm_momentum)
+            sportsbook_edge=sb_edge, pm_momentum=pm_momentum,
+            asklivermore=asklivermore)
 
         # Count active data sources
         sources = sum(bool(x) for x in [coinglass, polygon, cryptoquant, twitter,
                                           alphavantage, odds_client, sentiment,
-                                          orderflow, pm_momentum])
+                                          orderflow, pm_momentum, asklivermore])
         logger.info(f"Starting TradingTest in {config.mode} mode with {sources} data sources")
         await telegram.send(
             f"🚀 <b>TradingTest started</b>\n"
@@ -157,7 +166,7 @@ async def run_bot(config: Config):
 
             # Cleanup all clients
             for client in [simmer, odds_client, coinglass, polygon,
-                           cryptoquant, twitter, alphavantage]:
+                           cryptoquant, twitter, alphavantage, asklivermore]:
                 if client:
                     try:
                         await client.__aexit__(None, None, None)

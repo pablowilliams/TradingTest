@@ -225,6 +225,52 @@ class Database:
         )
         await self.db.commit()
 
+    # --- Bot Configs (persist across restarts) ---
+    async def save_bot_config(self, bot_id: str, strategy: str, params: dict,
+                               generation: int = 0, parent_id: str = None):
+        await self.db.execute(
+            """INSERT OR REPLACE INTO bot_configs (bot_id, strategy, params, generation,
+               parent_id, created_at) VALUES (?, ?, ?, ?, ?, ?)""",
+            (bot_id, strategy, json.dumps(params), generation, parent_id, time.time()))
+        await self.db.commit()
+
+    async def get_all_bot_configs(self) -> list:
+        cursor = await self.db.execute("SELECT * FROM bot_configs")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_bot_config(self, bot_id: str):
+        await self.db.execute("DELETE FROM bot_configs WHERE bot_id=?", (bot_id,))
+        await self.db.commit()
+
+    # --- AskLivermore Signals ---
+    async def save_asklivermore_signals(self, signals: list):
+        for s in signals:
+            await self.db.execute(
+                """INSERT INTO asklivermore_signals (ticker, pattern, grade, price, details, scraped_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (s.get("ticker", ""), s.get("pattern", ""), s.get("grade", ""),
+                 s.get("price", 0), s.get("details", ""), time.time()))
+        await self.db.commit()
+
+    async def get_latest_asklivermore_signals(self, grade: str = None) -> list:
+        if grade:
+            cursor = await self.db.execute(
+                "SELECT * FROM asklivermore_signals WHERE grade=? ORDER BY scraped_at DESC LIMIT 50",
+                (grade,))
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM asklivermore_signals ORDER BY scraped_at DESC LIMIT 50")
+        return [dict(row) for row in await cursor.fetchall()]
+
+    # --- Daily Stats ---
+    async def save_daily_stats(self, date: str, trades: int, pnl: float,
+                                best_bot: str, best_wr: float):
+        await self.db.execute(
+            """INSERT OR REPLACE INTO daily_stats (date, total_trades, total_pnl,
+               best_bot, best_win_rate) VALUES (?, ?, ?, ?, ?)""",
+            (date, trades, pnl, best_bot, best_wr))
+        await self.db.commit()
+
     # --- Summary ---
     async def get_daily_summary(self) -> dict:
         cursor = await self.db.execute(

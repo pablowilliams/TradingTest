@@ -20,6 +20,7 @@ PDF optimizations applied:
 - 8% daily loss limit hard cap
 """
 import asyncio
+import json
 import logging
 import random
 import time
@@ -32,8 +33,18 @@ from ..strategies.sports_edge import SportsEdgeStrategy
 from ..strategies.soccer_3way import Soccer3WayStrategy
 from ..strategies.sniper import SniperStrategy
 from ..strategies.hybrid import HybridStrategy
+from ..market_discovery.discovery import MarketDiscovery, AskLivermoreXRef
 
 logger = logging.getLogger(__name__)
+
+# Try to import Rust engine, fall back to pure Python
+try:
+    from trading_engine import OrderbookProcessor, combine_signals, check_soccer_3way
+    RUST_AVAILABLE = True
+    logger.info("Rust engine loaded")
+except ImportError:
+    RUST_AVAILABLE = False
+    logger.info("Rust engine not available, using pure Python")
 
 STRATEGY_MAP = {
     "momentum": MomentumStrategy,
@@ -50,11 +61,12 @@ class Arena:
 
     def __init__(self, config, db, pm_client, simmer_client, verifier,
                  position_manager, telegram, price_feed, scorer, learner,
-                 # New API clients
+                 # API clients
                  coinglass=None, polygon=None, cryptoquant=None,
                  twitter=None, alphavantage=None, odds_client=None,
                  sentiment_scorer=None, orderflow_signal=None,
-                 sportsbook_edge=None, pm_momentum=None):
+                 sportsbook_edge=None, pm_momentum=None,
+                 asklivermore=None):
         self.config = config
         self.db = db
         self.pm = pm_client
@@ -77,32 +89,68 @@ class Arena:
         self.orderflow = orderflow_signal
         self.sportsbook_edge = sportsbook_edge
         self.pm_momentum = pm_momentum
+        self.asklivermore = asklivermore
+
+        # Market discovery + AskLivermore cross-reference
+        self.discovery = MarketDiscovery(pm_client, config.__dict__ if hasattr(config, '__dict__') else {})
+        self.al_xref = AskLivermoreXRef(polygon, alphavantage)
+
+        # Rust orderbook processor (if available)
+        self.rust_orderbook = OrderbookProcessor() if RUST_AVAILABLE else None
 
         self.bots = {}
         self._running = False
 
-        # Cached enriched signals (updated periodically, not per-market)
+        # Cached enriched signals
         self._global_signals: dict = {}
         self._last_global_update: float = 0
-        self._global_update_interval: float = 60  # Update every 60s
+        self._global_update_interval: float = 60
+
+        # AskLivermore signals cache
+        self._al_signals: list = []
+        self._last_al_scrape: float = 0
+        self._al_scrape_interval: float = 3600  # Scrape once per hour
 
         # Circuit breaker state
-        self._consecutive_losses: dict = {}  # bot_id -> count
-        self._suspended_until: dict = {}  # bot_id -> timestamp
+        self._consecutive_losses: dict = {}
+        self._suspended_until: dict = {}
 
-    def create_bots(self):
+    async def create_bots(self):
+        """Initialize bots - restore from DB if available, else create fresh."""
+        signal_weights = self.config.signals if hasattr(self.config, 'signals') else {}
+
+        # Try to restore from DB first
+        saved_configs = await self.db.get_all_bot_configs()
+        if saved_configs:
+            for cfg in saved_configs:
+                strategy = cfg["strategy"]
+                cls = STRATEGY_MAP.get(strategy)
+                if cls:
+                    params = json.loads(cfg["params"]) if isinstance(cfg["params"], str) else cfg["params"]
+                    bot = cls(cfg["bot_id"], params, cfg.get("generation", 0))
+                    bot.weights = {**bot.DEFAULT_WEIGHTS, **signal_weights}
+                    self.bots[cfg["bot_id"]] = bot
+                    logger.info(f"Restored bot: {cfg['bot_id']} (gen {cfg.get('generation', 0)})")
+            if self.bots:
+                logger.info(f"Restored {len(self.bots)} bots from database")
+                return
+
+        # Create fresh bots
         for name, cls in STRATEGY_MAP.items():
             if self.config.strategies.get(name, {}).get("enabled", True):
                 bot_id = f"{name}-v1"
-                self.bots[bot_id] = cls(bot_id)
+                bot = cls(bot_id)
+                bot.weights = {**bot.DEFAULT_WEIGHTS, **signal_weights}
+                self.bots[bot_id] = bot
+                await self.db.save_bot_config(bot_id, name, bot.params, 0)
                 logger.info(f"Created bot: {bot_id}")
 
     async def run(self):
         self._running = True
-        self.create_bots()
+        await self.create_bots()
         await self.price_feed.start()
 
-        last_trade, last_resolve, last_evolve = 0, 0, 0
+        last_trade, last_resolve, last_evolve, last_al = 0, 0, 0, 0
         logger.info(f"Arena started with {len(self.bots)} bots, all data sources active")
 
         while self._running:
@@ -116,6 +164,9 @@ class Arena:
             if now - last_evolve >= self.config.evolution_interval_seconds:
                 last_evolve = now
                 await self._evolution_cycle()
+            if now - last_al >= self._al_scrape_interval:
+                last_al = now
+                await self._asklivermore_cycle()
             await asyncio.sleep(1)
 
     async def stop(self):
@@ -260,7 +311,8 @@ class Arena:
             # Update global (expensive) signals
             await self._gather_global_signals()
 
-            markets = await self.pm.gamma.get_markets(limit=50, active=True)
+            # Use MarketDiscovery for categorized, enriched markets
+            markets = await self.discovery.discover_all()
             price_snap = self.price_feed.get_snapshot()
 
             for market in markets:
@@ -282,9 +334,8 @@ class Arena:
                     try:
                         tokens = market.get("clobTokenIds", [])
                         if isinstance(tokens, str):
-                            import json
                             try: tokens = json.loads(tokens)
-                            except: tokens = []
+                            except (json.JSONDecodeError, TypeError): tokens = []
                         if tokens:
                             mom = await self.pm_momentum.get_momentum(tokens[0])
                             signals["pm_direction"] = mom.get("direction", "unknown")
@@ -294,19 +345,27 @@ class Arena:
                     except Exception:
                         signals.setdefault("pm_direction", "unknown")
 
-                # Per-market orderflow
+                # Per-market orderflow (use Rust engine if available)
                 if self.orderflow:
                     try:
                         tokens = market.get("clobTokenIds", [])
                         if isinstance(tokens, str):
-                            import json
                             try: tokens = json.loads(tokens)
-                            except: tokens = []
+                            except (json.JSONDecodeError, TypeError): tokens = []
                         if tokens:
                             of = await self.orderflow.analyze(tokens[0])
                             signals["orderflow_imbalance"] = of.get("imbalance", 0)
                             signals["spread"] = of.get("spread", 1)
                             signals["volume_pressure"] = of.get("volume_pressure", 0)
+
+                            # Use Rust for faster orderbook metrics if available
+                            if self.rust_orderbook and of.get("best_bid") and of.get("best_ask"):
+                                book = await self.pm.clob.get_orderbook(tokens[0])
+                                bids = [(float(b["price"]), float(b["size"])) for b in book.get("bids", [])]
+                                asks = [(float(a["price"]), float(a["size"])) for a in book.get("asks", [])]
+                                self.rust_orderbook.update(bids, asks)
+                                signals["spread"] = self.rust_orderbook.spread()
+                                signals["orderflow_imbalance"] = self.rust_orderbook.imbalance()
                     except Exception:
                         pass
 
@@ -328,9 +387,8 @@ class Arena:
                     try:
                         outcomes = market.get("outcomes", [])
                         if isinstance(outcomes, str):
-                            import json
                             try: outcomes = json.loads(outcomes)
-                            except: outcomes = []
+                            except (json.JSONDecodeError, TypeError): outcomes = []
                         if outcomes and len(outcomes) >= 2:
                             team_sent = await self.twitter.get_sports_sentiment(outcomes[0])
                             signals["team1_twitter_signal"] = team_sent.get("signal", 0)
@@ -537,17 +595,79 @@ class Arena:
                     continue
 
                 new_params = parent_bot.mutate()
-                # Unique ID: strategy-gen-timestamp to avoid collisions
                 gen = parent_bot.generation + 1
                 new_id = f"{parent_bot.strategy_name}-g{gen}-{int(time.time()) % 10000}"
                 cls = STRATEGY_MAP.get(parent_bot.strategy_name)
                 if cls:
+                    # Remove old bot from memory and DB
                     self.bots.pop(loser["bot_id"], None)
-                    self.bots[new_id] = cls(new_id, new_params, parent_bot.generation + 1)
+                    await self.db.delete_bot_config(loser["bot_id"])
+
+                    # Create and persist new bot
+                    new_bot = cls(new_id, new_params, gen)
+                    signal_weights = self.config.signals if hasattr(self.config, 'signals') else {}
+                    new_bot.weights = {**new_bot.DEFAULT_WEIGHTS, **signal_weights}
+                    self.bots[new_id] = new_bot
+                    await self.db.save_bot_config(
+                        new_id, parent_bot.strategy_name, new_params, gen, parent_bot.bot_id)
+
                     await self.telegram.notify_evolution(
                         loser["bot_id"], new_id,
                         f"WR {loser['win_rate']:.1%} < {survival_wr:.0%}")
                     logger.info(f"Evolution: {loser['bot_id']} -> {new_id}")
 
+            # Save daily stats
+            import datetime
+            today = datetime.date.today().isoformat()
+            best = max(eligible, key=lambda x: x["win_rate"]) if eligible else None
+            summary = await self.db.get_daily_summary()
+            await self.db.save_daily_stats(
+                today, summary.get("trades", 0), summary.get("total_pnl", 0),
+                best["bot_id"] if best else "", best["win_rate"] if best else 0)
+
         except Exception as e:
             logger.error(f"Evolution error: {e}")
+
+    async def _asklivermore_cycle(self):
+        """Scrape AskLivermore A+ signals and cross-reference with Polymarket."""
+        if not self.asklivermore:
+            return
+        try:
+            logger.info("Scraping AskLivermore signals...")
+            if not await self.asklivermore.login():
+                logger.warning("AskLivermore login failed")
+                return
+
+            signals = await self.asklivermore.get_a_plus_signals()
+            if not signals:
+                logger.info("No A+ signals found")
+                return
+
+            # Persist to DB
+            await self.db.save_asklivermore_signals(signals)
+
+            # Enrich with live market data
+            enriched = await self.al_xref.enrich_signals(signals)
+
+            # Find Polymarket correlations
+            pm_markets = await self.discovery.discover_all()
+            correlations = self.al_xref.find_polymarket_correlations(enriched, pm_markets)
+
+            # Store correlations as global signals
+            if correlations:
+                bullish_sectors = sum(1 for c in correlations if c["stock_trend"] == "bullish")
+                bearish_sectors = sum(1 for c in correlations if c["stock_trend"] == "bearish")
+                self._global_signals["al_bullish_sectors"] = bullish_sectors
+                self._global_signals["al_bearish_sectors"] = bearish_sectors
+                self._global_signals["al_sector_signal"] = (
+                    0.2 if bullish_sectors > bearish_sectors else
+                    -0.2 if bearish_sectors > bullish_sectors else 0)
+
+            self._al_signals = enriched
+
+            # Telegram notification
+            await self.telegram.notify_asklivermore(signals)
+            logger.info(f"AskLivermore: {len(signals)} A+ signals, {len(correlations)} PM correlations")
+
+        except Exception as e:
+            logger.error(f"AskLivermore cycle error: {e}")

@@ -7,13 +7,26 @@ from abc import ABC, abstractmethod
 
 
 class BaseStrategy(ABC):
-    def __init__(self, bot_id: str, strategy_name: str, params: dict = None, generation: int = 0):
+    # Default signal weights (overridden by config.signals if provided)
+    DEFAULT_WEIGHTS = {
+        "market_price_weight": 0.50,
+        "btc_momentum_weight": 0.15,
+        "pm_momentum_weight": 0.10,
+        "strategy_weight": 0.15,
+        "learning_weight_min": 0.05,
+        "learning_weight_max": 0.30,
+    }
+
+    def __init__(self, bot_id: str, strategy_name: str, params: dict = None,
+                 generation: int = 0, signal_weights: dict = None):
         self.bot_id = bot_id
         self.strategy_name = strategy_name
         self.params = params or {}
         self.generation = generation
         self.learning_data: dict = {}
         self.total_observations: int = 0
+        # Merge config weights over defaults
+        self.weights = {**self.DEFAULT_WEIGHTS, **(signal_weights or {})}
 
     def make_decision(self, market: dict, signals: dict) -> dict:
         yes_price = self._get_yes_price(market)
@@ -32,14 +45,24 @@ class BaseStrategy(ABC):
         strat_signal = self.get_strategy_signal(market, signals)
         learn_bias = self.get_learning_bias(market, signals)
 
-        # Dynamic learning weight
-        min_lw = self.params.get("learning_weight_min", 0.05)
-        max_lw = self.params.get("learning_weight_max", 0.30)
-        lw = min(min_lw + (self.total_observations / 500) * (max_lw - min_lw), max_lw)
-        scale = (1.0 - lw) / 0.90
+        # Read weights from config (not hardcoded)
+        w_mkt = self.weights["market_price_weight"]
+        w_btc = self.weights["btc_momentum_weight"]
+        w_pm = self.weights["pm_momentum_weight"]
+        w_strat = self.weights["strategy_weight"]
 
-        combined = (mkt_signal * 0.50 * scale + btc_mom * 0.15 * scale +
-                    pm_mom * 0.10 * scale + strat_signal * 0.15 * scale + learn_bias * lw)
+        # Dynamic learning weight scales with observations
+        min_lw = self.weights["learning_weight_min"]
+        max_lw = self.weights["learning_weight_max"]
+        lw = min(min_lw + (self.total_observations / 500) * (max_lw - min_lw), max_lw)
+
+        # Normalize base weights to fill remaining after learning
+        base_sum = w_mkt + w_btc + w_pm + w_strat
+        scale = (1.0 - lw) / base_sum if base_sum > 0 else 1.0
+
+        combined = (mkt_signal * w_mkt * scale + btc_mom * w_btc * scale +
+                    pm_mom * w_pm * scale + strat_signal * w_strat * scale +
+                    learn_bias * lw)
 
         if time_remaining < 60:
             combined *= 1.0 + self.params.get("late_window_boost", 0.25)
